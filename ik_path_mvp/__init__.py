@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 6),
+    "version": (0, 5, 7),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. World-space trajectory locks (замочки), non-destructive cancel, direct bone isolation",
+    "description": "Draw path + live preview. Colored motion curves, world-space locks, non-destructive cancel",
     "category": "Animation",
 }
 
@@ -272,6 +272,12 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
 
     smooth_path: bpy.props.BoolProperty(
         name="Smooth Path",
+        default=True,
+    )
+
+    keep_motion_curves: bpy.props.BoolProperty(
+        name="Keep Motion Curves",
+        description="Leave colored trajectory curves in the viewport to compare animation against drawn lines",
         default=True,
     )
 
@@ -626,12 +632,65 @@ def get_last_stroke_world(gp_obj):
 
 
 # ============================================================
-# Curve / path helpers
+# Curve / path helpers & Motion Palette
 # ============================================================
 
+CURVE_PALETTE = [
+    (0.0, 0.85, 1.0, 1.0),   # 0: Electric Cyan
+    (1.0, 0.45, 0.0, 1.0),   # 1: Bright Orange
+    (0.2, 1.0, 0.25, 1.0),   # 2: Lime Green
+    (1.0, 0.15, 0.7, 1.0),   # 3: Magenta / Hot Pink
+    (1.0, 0.85, 0.0, 1.0),   # 4: Golden Yellow
+    (0.65, 0.25, 1.0, 1.0),  # 5: Bright Purple
+    (1.0, 0.25, 0.25, 1.0),  # 6: Coral Red
+    (0.1, 1.0, 0.75, 1.0),   # 7: Mint / Teal
+]
+
+
+def _get_or_create_curves_collection(context):
+    col = bpy.data.collections.get('IKPath_Curves')
+    if not col:
+        col = bpy.data.collections.new('IKPath_Curves')
+        context.scene.collection.children.link(col)
+    return col
+
+
+def _assign_curve_color(curve_obj, col, bone_tag=""):
+    existing_curves = [o for o in col.objects if o.type == 'CURVE' and o != curve_obj]
+    idx = len(existing_curves) % len(CURVE_PALETTE)
+    color_rgba = CURVE_PALETTE[idx]
+    curve_obj.color = color_rgba
+
+    mat_name = f"IKPath_Mat_{bone_tag or idx}"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+        if hasattr(mat, "use_nodes"):
+            mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get('Principled BSDF') if mat.node_tree else None
+        if bsdf:
+            bsdf.inputs['Base Color'].default_value = color_rgba
+            if 'Emission Color' in bsdf.inputs:
+                bsdf.inputs['Emission Color'].default_value = color_rgba
+            if 'Emission Strength' in bsdf.inputs:
+                bsdf.inputs['Emission Strength'].default_value = 0.5
+    mat.diffuse_color = color_rgba
+
+    if not curve_obj.data.materials:
+        curve_obj.data.materials.append(mat)
+    else:
+        curve_obj.data.materials[0] = mat
+
+
 def create_curve_from_points(context, name, points):
-    curve_data = bpy.data.curves.new(name, type='CURVE')
+    s = context.scene.ik_path_mvp
+    col = _get_or_create_curves_collection(context)
+    bone_tag = s.effector_bone or "motion"
+    curve_name = f"IKPath_{bone_tag}"
+
+    curve_data = bpy.data.curves.new(curve_name, type='CURVE')
     curve_data.dimensions = '3D'
+    curve_data.bevel_depth = 0.003
 
     spline = curve_data.splines.new('POLY')
 
@@ -644,8 +703,9 @@ def create_curve_from_points(context, name, points):
     for i, co in enumerate(points):
         spline.points[i].co = (co.x, co.y, co.z, 1.0)
 
-    curve_obj = bpy.data.objects.new(name, curve_data)
-    context.collection.objects.link(curve_obj)
+    curve_obj = bpy.data.objects.new(curve_name, curve_data)
+    col.objects.link(curve_obj)
+    _assign_curve_color(curve_obj, col, bone_tag)
 
     return curve_obj
 
@@ -1652,11 +1712,12 @@ def run_bake(context, is_preview=False):
                 msg += f", {len(world_trajectories)} locked"
             msg += f", {key_count} keys"
 
-            if not is_preview and s.delete_path_after_bake:
-                bpy.data.objects.remove(path_obj, do_unlink=True)
+            if not is_preview:
+                if not s.keep_motion_curves and s.delete_path_after_bake:
+                    bpy.data.objects.remove(path_obj, do_unlink=True)
+                    msg += ", path deleted"
                 s.path_name = ""
                 s.is_preview = False
-                msg += ", path deleted"
             elif is_preview:
                 s.is_preview = True
                 msg += " [Preview active]"
@@ -1726,11 +1787,12 @@ def run_bake(context, is_preview=False):
             msg += f" ({len(world_trajectories)} world locked)"
         msg += f", {key_count} keys"
 
-        if not is_preview and s.delete_path_after_bake:
-            bpy.data.objects.remove(path_obj, do_unlink=True)
+        if not is_preview:
+            if not s.keep_motion_curves and s.delete_path_after_bake:
+                bpy.data.objects.remove(path_obj, do_unlink=True)
+                msg += ", path deleted"
             s.path_name = ""
             s.is_preview = False
-            msg += ", path deleted"
         elif is_preview:
             s.is_preview = True
             msg += " [Preview active]"
@@ -1815,11 +1877,12 @@ def run_bake(context, is_preview=False):
 
     msg = f"Baked {len(selected)} object(s), {key_count} keys"
 
-    if not is_preview and s.delete_path_after_bake:
-        bpy.data.objects.remove(path_obj, do_unlink=True)
+    if not is_preview:
+        if not s.keep_motion_curves and s.delete_path_after_bake:
+            bpy.data.objects.remove(path_obj, do_unlink=True)
+            msg += ", path deleted"
         s.path_name = ""
         s.is_preview = False
-        msg += ", path deleted"
     elif is_preview:
         s.is_preview = True
         msg += " [Preview active]"
@@ -2048,13 +2111,27 @@ class IKPATHMVP_OT_draw_path(bpy.types.Operator):
 
         s = context.scene.ik_path_mvp
 
-        for obj in list(bpy.data.objects):
-            if obj.name.startswith("IKPathMVP") and obj != self._preview:
-                bpy.data.objects.remove(obj, do_unlink=True)
+        if not s.keep_motion_curves:
+            for obj in list(bpy.data.objects):
+                if (obj.name.startswith("IKPathMVP") or obj.name.startswith("IKPath_")) and obj != self._preview:
+                    bpy.data.objects.remove(obj, do_unlink=True)
 
-        self._preview.name = "IKPathMVP"
-        self._preview.data.name = "IKPathMVP"
-        self._preview.data.bevel_depth = 0.002
+        bone_tag = s.effector_bone or "motion"
+        target_name = f"IKPath_{bone_tag}"
+        self._preview.name = target_name
+        self._preview.data.name = target_name
+        self._preview.data.bevel_depth = 0.003
+
+        col = _get_or_create_curves_collection(context)
+        if self._preview.name not in col.objects:
+            col.objects.link(self._preview)
+        for c in bpy.data.collections:
+            if c != col and self._preview.name in c.objects:
+                c.objects.unlink(self._preview)
+        if self._preview.name in context.scene.collection.objects and col != context.scene.collection:
+            context.scene.collection.objects.unlink(self._preview)
+
+        _assign_curve_color(self._preview, col, bone_tag)
 
         path_obj = self._preview
         self._preview = None
@@ -2362,15 +2439,20 @@ class IKPATHMVP_OT_clear_world_locks(bpy.types.Operator):
 class IKPATHMVP_OT_apply_bake(bpy.types.Operator):
     bl_idname = "ikpathmvp.apply_bake"
     bl_label = "Apply Bake"
-    bl_description = "Finalize the animation and delete the preview path"
+    bl_description = "Finalize the animation and optionally keep or delete the path curve"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         global _preview_rest_state
         s = context.scene.ik_path_mvp
         path_obj = bpy.data.objects.get(s.path_name)
-        if path_obj and s.delete_path_after_bake:
-            bpy.data.objects.remove(path_obj, do_unlink=True)
+        if path_obj:
+            if not s.keep_motion_curves and s.delete_path_after_bake:
+                bpy.data.objects.remove(path_obj, do_unlink=True)
+            else:
+                col = _get_or_create_curves_collection(context)
+                bone_tag = s.effector_bone or "motion"
+                _assign_curve_color(path_obj, col, bone_tag)
             s.path_name = ""
 
         clear_preview_rest_state()
@@ -2442,12 +2524,69 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IKPATHMVP_OT_toggle_curves_visibility(bpy.types.Operator):
+    bl_idname = "ikpathmvp.toggle_curves_visibility"
+    bl_label = "Show / Hide Curves"
+    bl_description = "Show or hide all motion path curves in the 3D viewport"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        col = bpy.data.collections.get('IKPath_Curves')
+        curves = []
+        if col:
+            curves.extend([o for o in col.objects if o.type == 'CURVE'])
+        for o in bpy.data.objects:
+            if o.type == 'CURVE' and (o.name.startswith("IKPath_") or o.name.startswith("IKPathMVP")) and o not in curves:
+                curves.append(o)
+
+        if not curves:
+            self.report({'INFO'}, "No motion curves found in scene")
+            return {'FINISHED'}
+
+        any_visible = any(not o.hide_viewport for o in curves)
+        target_hide = any_visible
+        for o in curves:
+            o.hide_viewport = target_hide
+
+        state_str = "hidden" if target_hide else "visible"
+        self.report({'INFO'}, f"Motion curves {state_str}")
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_clear_all_curves(bpy.types.Operator):
+    bl_idname = "ikpathmvp.clear_all_curves"
+    bl_label = "Clear All Curves"
+    bl_description = "Delete all stored motion path curves from the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        col = bpy.data.collections.get('IKPath_Curves')
+        count = 0
+        if col:
+            for obj in list(col.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+                count += 1
+        for obj in list(bpy.data.objects):
+            if obj.type == 'CURVE' and (obj.name.startswith("IKPath_") or obj.name.startswith("IKPathMVP")):
+                bpy.data.objects.remove(obj, do_unlink=True)
+                count += 1
+
+        if s.is_preview:
+            clear_preview_rest_state()
+            s.is_preview = False
+        s.path_name = ""
+
+        self.report({'INFO'}, f"Cleared {count} motion curve(s)")
+        return {'FINISHED'}
+
+
 # ============================================================
 # UI Panel
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.6"
+    bl_label = "IK Path MVP v0.5.7"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2555,9 +2694,14 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
         box.prop(s, "filter_constrained")
         box.prop(s, "chain_override", text="Override")
 
-        # Path
+        # Path & Motion Curves
         box = layout.box()
-        box.label(text="Path", icon='CURVE_DATA')
+        box.label(text="Path & Motion Curves", icon='CURVE_DATA')
+        box.prop(s, "keep_motion_curves")
+
+        row = box.row(align=True)
+        row.operator("ikpathmvp.toggle_curves_visibility", text="Show / Hide Curves", icon='HIDE_OFF')
+        row.operator("ikpathmvp.clear_all_curves", text="Clear All", icon='TRASH')
 
         box.operator(
             "ikpathmvp.create_path",
@@ -2622,6 +2766,8 @@ class VIEW3D_MT_ikpath_mvp_menu(bpy.types.Menu):
 
         layout.operator("ikpathmvp.clear_controller", icon='X')
         layout.operator("ikpathmvp.clear_path", icon='X')
+        layout.operator("ikpathmvp.toggle_curves_visibility", icon='HIDE_OFF')
+        layout.operator("ikpathmvp.clear_all_curves", icon='TRASH')
 
 
 def menu_func(self, context):
@@ -2643,6 +2789,8 @@ classes = (
     IKPATHMVP_OT_apply_bake,
     IKPATHMVP_OT_cancel_preview,
     IKPATHMVP_OT_clear_path,
+    IKPATHMVP_OT_toggle_curves_visibility,
+    IKPATHMVP_OT_clear_all_curves,
     IKPATHMVP_OT_pin_bones,
     IKPATHMVP_OT_unpin_bones,
     IKPATHMVP_OT_toggle_world_lock,
