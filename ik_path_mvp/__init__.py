@@ -1,7 +1,7 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
     "description": "Draw path + bake. Body Drag with Rigify-aware chain filter",
@@ -137,9 +137,29 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
     body_rotate: bpy.props.FloatProperty(
         name="Body Lean",
         description="Amount of body/root tilt and turn towards the pull direction (0 = none, 1 = full tilt)",
-        default=0.25,
+        default=0.5,
         min=0.0,
         max=1.0,
+    )
+
+    leg_dangle: bpy.props.BoolProperty(
+        name="Leg Drag & Dangle",
+        description="Legs stay on floor until body lifts higher than leg length, then dangle and trail behind body",
+        default=True,
+    )
+
+    leg_dangle_amount: bpy.props.FloatProperty(
+        name="Toe Point",
+        description="How much feet point down along the leg when dangling in air",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+    )
+
+    pinned_bones: bpy.props.StringProperty(
+        name="Pinned Bones",
+        description="Comma-separated list of bones locked in world space during bake",
+        default="",
     )
 
     max_reach: bpy.props.FloatProperty(
@@ -1034,6 +1054,15 @@ def run_bake(context):
 
         inv = arm.matrix_world.inverted()
 
+        # Collect pinned bones (lock in world space)
+        pinned_bones_list = []
+        if s.pinned_bones.strip():
+            for b_name in s.pinned_bones.split(','):
+                bn = b_name.strip()
+                if bn and bn in arm.pose.bones:
+                    pinned_bones_list.append(arm.pose.bones[bn])
+        pinned_matrices = {b: (arm.matrix_world @ b.matrix).copy() for b in pinned_bones_list}
+
         # =============================================
         # BODY DRAG  —  Direct head placement + Root Follow with Slack
         # =============================================
@@ -1055,12 +1084,38 @@ def run_bake(context):
             # Find natural unstretched reach and body anchor (spine/chest)
             max_reach, base_pb = _get_chain_reach_and_base(arm, pb, s.max_reach)
             base_world_start = (arm.matrix_world @ base_pb.matrix).translation.copy() if base_pb else None
-            spine_ref_dir = (base_world_start - root_world_start).normalized() if (base_world_start and root_world_start) else Vector((0.0, 0.0, 1.0))
+
+            # Legs auto-drag / dangling setup
+            leg_controllers = []
+            if s.leg_dangle:
+                for b_cand in arm.pose.bones:
+                    nm = b_cand.name.lower()
+                    if ('foot_ik' in nm or ('foot' in nm and 'ik' in nm)) and ('parent' not in nm and 'target' not in nm and 'tweak' not in nm):
+                        if b_cand not in pinned_bones_list and b_cand is not pb and b_cand is not root_pb:
+                            side = '.L' if '.l' in nm else ('.R' if '.r' in nm else '')
+                            hip_cand = None
+                            for hn in [f'thigh_parent{side}', f'DEF-thigh{side}', f'thigh_fk{side}']:
+                                if hn in arm.pose.bones:
+                                    hip_cand = arm.pose.bones[hn]
+                                    break
+                            f_start_w = (arm.matrix_world @ b_cand.matrix).translation.copy()
+                            h_start_w = (arm.matrix_world @ hip_cand.matrix).translation.copy() if hip_cand else None
+                            leg_l = (f_start_w - h_start_w).length if h_start_w else 0.46
+                            leg_controllers.append({
+                                'bone': b_cand,
+                                'hip': hip_cand,
+                                'foot_start_w': f_start_w,
+                                'hip_start_w': h_start_w,
+                                'leg_len': leg_l,
+                                'foot_start_m': (arm.matrix_world @ b_cand.matrix).copy(),
+                            })
 
             print(
                 f"[IKPath BODY_DRAG] max_reach={max_reach:.4f}, "
                 f"base={base_pb.name if base_pb else 'None'}, "
-                f"root={root_pb.name if root_pb else 'None'}"
+                f"root={root_pb.name if root_pb else 'None'}, "
+                f"pinned={[b.name for b in pinned_bones_list]}, "
+                f"legs={[l['bone'].name for l in leg_controllers]}"
             )
 
             arm_scale = arm.matrix_world.to_scale()
@@ -1094,6 +1149,17 @@ def run_bake(context):
                             if body_move_world.length > cap:
                                 body_move_world = body_move_world * (cap / body_move_world.length)
 
+                # Determine head position first for tension vector
+                if base_world_start is not None and max_reach > 1e-4 and s.limit_stretch:
+                    current_base = base_world_start + body_move_world
+                    to_target = pos - current_base
+                    if to_target.length > max_reach:
+                        head_pos = current_base + to_target.normalized() * max_reach
+                    else:
+                        head_pos = pos
+                else:
+                    head_pos = pos
+
                 # Move and rotate root
                 if root_pb is not None:
                     if body_move_world.length > 1e-6:
@@ -1103,25 +1169,16 @@ def run_bake(context):
                     else:
                         root_pb.location = root_start.copy()
 
-                    # Determine head position first for tension vector
-                    if base_world_start is not None and max_reach > 1e-4 and s.limit_stretch:
-                        current_base = base_world_start + body_move_world
-                        to_target = pos - current_base
-                        if to_target.length > max_reach:
-                            head_pos = current_base + to_target.normalized() * max_reach
-                        else:
-                            head_pos = pos
-                    else:
-                        head_pos = pos
-
-                    # Rotate/tilt root towards pull direction
+                    # Rotate/tilt root towards pull direction (responsive angle)
                     if s.body_rotate > 0.0 and root_base_rot is not None:
                         current_root_world = root_world_start + body_move_world
                         tension_vec = head_pos - current_root_world
-                        if tension_vec.length > 1e-4 and spine_ref_dir.length > 1e-4:
-                            q_diff = spine_ref_dir.rotation_difference(tension_vec.normalized())
+                        v_0 = start_translation - root_world_start
+                        if tension_vec.length > 1e-4 and v_0.length > 1e-4:
+                            q_diff = v_0.normalized().rotation_difference(tension_vec.normalized())
                             if q_diff.angle > 1e-5:
-                                q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_diff, s.body_rotate)
+                                factor = min(1.0, s.body_rotate * 2.0)
+                                q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_diff, factor)
                                 _apply_world_rotation_to_root(arm, root_pb, q_applied, root_base_rot)
                             else:
                                 _restore_rot(root_pb, root_base_rot)
@@ -1134,22 +1191,58 @@ def run_bake(context):
                     context.view_layer.update()
                     keyframe_pose_bone_location(root_pb, frame)
                     keyframe_pose_bone_rotation(root_pb, frame)
-                else:
-                    head_pos = pos
 
+                # Head placement
                 m = start_matrix_world.copy()
                 m.translation = head_pos
                 pb.matrix = inv @ m
                 context.view_layer.update()
                 keyframe_pose_bone(pb, frame)
 
-                # --- 3. Preserve offsets of other selected bones ---
+                # Legs auto-drag / dangling
+                for leg in leg_controllers:
+                    b_cand = leg['bone']
+                    hip = leg['hip']
+                    f_start_w = leg['foot_start_w']
+                    h_start_w = leg['hip_start_w']
+                    leg_len = leg['leg_len']
+                    f_start_m = leg['foot_start_m']
+
+                    if hip and h_start_w and body_move_world.length > 1e-4:
+                        h_cur_w = (arm.matrix_world @ hip.matrix).translation
+                        dist_to_ground = (h_cur_w - f_start_w).length
+
+                        if dist_to_ground <= leg_len:
+                            m_f = f_start_m.copy()
+                            m_f.translation = f_start_w
+                        else:
+                            move_dir = body_move_world.normalized()
+                            hang_dir = (Vector((0.0, 0.0, -1.0)) - move_dir * 0.45).normalized()
+                            t_pos = h_cur_w + hang_dir * leg_len
+                            rot_down = Quaternion((1.0, 0.0, 0.0), radians(-55.0 * s.leg_dangle_amount))
+                            m_f = f_start_m.copy() @ rot_down.to_matrix().to_4x4()
+                            m_f.translation = t_pos
+
+                        b_cand.matrix = inv @ m_f
+                        context.view_layer.update()
+                        keyframe_pose_bone(b_cand, frame)
+
+                # Apply pinned bones (lock in world space)
+                for b_pin, m_w in pinned_matrices.items():
+                    b_pin.matrix = inv @ m_w
+                context.view_layer.update()
+                for b_pin in pinned_matrices.keys():
+                    keyframe_pose_bone(b_pin, frame)
+
+                # Preserve offsets of other selected bones
                 for b, d in deltas.items():
-                    b.matrix = pb.matrix @ d
+                    if b not in pinned_matrices:
+                        b.matrix = pb.matrix @ d
                 context.view_layer.update()
 
                 for b in deltas.keys():
-                    keyframe_pose_bone(b, frame)
+                    if b not in pinned_matrices:
+                        keyframe_pose_bone(b, frame)
 
             set_smooth_keys_obj(arm)
             context.scene.frame_set(s.frame_start)
@@ -1157,6 +1250,8 @@ def run_bake(context):
             msg = f"Body Drag: baked head {pb.name}"
             if root_pb is not None:
                 msg += f" + root {root_pb.name} (reach={max_reach:.2f}, follow={s.body_follow:.2f})"
+            if pinned_matrices:
+                msg += f", {len(pinned_matrices)} pinned"
             msg += f", {key_count} keys"
 
             if s.delete_path_after_bake:
@@ -1185,14 +1280,22 @@ def run_bake(context):
             context.view_layer.update()
 
             for b, d in deltas.items():
-                b.matrix = pb.matrix @ d
+                if b not in pinned_matrices:
+                    b.matrix = pb.matrix @ d
+
+            for b_pin, m_w in pinned_matrices.items():
+                b_pin.matrix = inv @ m_w
 
             context.view_layer.update()
 
             keyframe_pose_bone(pb, frame)
 
             for b in deltas.keys():
-                keyframe_pose_bone(b, frame)
+                if b not in pinned_matrices:
+                    keyframe_pose_bone(b, frame)
+
+            for b_pin in pinned_matrices.keys():
+                keyframe_pose_bone(b_pin, frame)
 
         set_smooth_keys_obj(arm)
 
@@ -1700,12 +1803,53 @@ class IKPATHMVP_OT_debug(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IKPATHMVP_OT_pin_bones(bpy.types.Operator):
+    bl_idname = "ikpathmvp.pin_bones"
+    bl_label = "Pin Selected"
+    bl_description = "Lock selected pose bones in world space during bake so they will not move"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        arm = bpy.data.objects.get(s.effector_object) or context.active_object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'WARNING'}, "Select an armature in Pose Mode first")
+            return {'CANCELLED'}
+
+        existing = [b.strip() for b in s.pinned_bones.split(',') if b.strip()]
+        added = []
+        for pb in arm.pose.bones:
+            if _pose_bone_selected(pb) and pb.name != s.effector_bone and pb.name != s.root_bone:
+                if pb.name not in existing:
+                    existing.append(pb.name)
+                    added.append(pb.name)
+
+        s.pinned_bones = ", ".join(existing)
+        if added:
+            self.report({'INFO'}, f"Pinned: {', '.join(added)}")
+        else:
+            self.report({'INFO'}, "No new bones to pin (select bones first)")
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_unpin_bones(bpy.types.Operator):
+    bl_idname = "ikpathmvp.unpin_bones"
+    bl_label = "Unpin All"
+    bl_description = "Clear all pinned bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.ik_path_mvp.pinned_bones = ""
+        self.report({'INFO'}, "All bone pins cleared")
+        return {'FINISHED'}
+
+
 # ============================================================
 # UI Panel
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.3.0"
+    bl_label = "IK Path MVP v0.4.0"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1753,6 +1897,9 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
         if s.solve_mode == 'BODY_DRAG':
             box.prop(s, "body_follow", slider=True)
             box.prop(s, "body_rotate", slider=True)
+            box.prop(s, "leg_dangle")
+            if s.leg_dangle:
+                box.prop(s, "leg_dangle_amount", slider=True)
             box.prop(s, "limit_stretch")
             box.prop(s, "max_reach")
             box.prop(s, "root_bone")
@@ -1762,6 +1909,15 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
             box.prop(s, "chain_max_length")
 
         box.prop(s, "path_mode")
+
+        # Pinned Bones (Lock in World)
+        box = layout.box()
+        box.label(text="Pinned Bones (Lock in World)", icon='PINNED')
+        row = box.row(align=True)
+        row.operator("ikpathmvp.pin_bones", text="Pin Selected", icon='RESTRICT_SELECT_OFF')
+        row.operator("ikpathmvp.unpin_bones", text="Unpin All", icon='X')
+        if s.pinned_bones.strip():
+            box.label(text=f"Locked: {s.pinned_bones}", icon='CHECKMARK')
 
         # Chain & Filters
         box = layout.box()
@@ -1858,6 +2014,8 @@ classes = (
     IKPATHMVP_OT_create_path,
     IKPATHMVP_OT_bake,
     IKPATHMVP_OT_clear_path,
+    IKPATHMVP_OT_pin_bones,
+    IKPATHMVP_OT_unpin_bones,
     IKPATHMVP_OT_debug,
     VIEW3D_PT_ikpath_mvp,
     VIEW3D_MT_ikpath_mvp_menu,
