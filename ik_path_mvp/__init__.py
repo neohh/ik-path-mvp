@@ -1,25 +1,32 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Real constraint bone pinning and two-phase physics",
+    "description": "Draw path + live preview. Horizontal root stability, torso lean, timeline preview stability",
     "category": "Animation",
 }
 
 
 import bpy
 from bpy_extras import view3d_utils
-from mathutils import Vector, Matrix, Quaternion
+from mathutils import Vector, Matrix, Quaternion, Euler
 from math import radians, degrees
 
 
 # ============================================================
-# Live Settings Update Callback
+# Live Settings Update Callback & State Cache
 # ============================================================
 
 _is_updating = False
+_preview_rest_state = {}
+
+
+def clear_preview_rest_state():
+    global _preview_rest_state
+    _preview_rest_state.clear()
+
 
 def _on_setting_updated(self, context):
     global _is_updating
@@ -146,6 +153,14 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         name="Root Bone",
         description="Bone that carries the leftover translation (whole body, no stretching). Empty = auto detect",
         default="",
+        update=_on_setting_updated,
+    )
+
+    body_bone: bpy.props.StringProperty(
+        name="Body Lean Bone",
+        description="Bone that tilts/leans towards pull direction (keeps Root bone horizontal). Empty = auto detect ('torso', 'chest', 'spine')",
+        default="",
+        update=_on_setting_updated,
     )
 
     root_max_translate: bpy.props.FloatProperty(
@@ -491,6 +506,31 @@ def _find_root_bone(arm, chain, s):
         cur = cur.parent
 
     return best
+
+
+def _find_body_bone(arm, root_pb, s=None):
+    """
+    Finds the main body / torso control bone to receive body lean/pitch rotation,
+    leaving the root bone strictly level and horizontal.
+    """
+    if s and hasattr(s, "body_bone") and s.body_bone.strip():
+        b = arm.pose.bones.get(s.body_bone.strip())
+        if b:
+            return b
+
+    candidates = ('torso', 'Torso', 'spine_master.002', 'spine_master', 'chest', 'spine', 'hips', 'pelvis')
+    for nm in candidates:
+        b = arm.pose.bones.get(nm)
+        if b is not None and b is not root_pb:
+            return b
+
+    for pb in arm.pose.bones:
+        nm = pb.name.lower()
+        if any(k in nm for k in ['torso', 'chest', 'spine']) and not any(p in nm for p in ['mch-', 'def-', 'org-', 'wgt-']):
+            if pb is not root_pb:
+                return pb
+
+    return None
 
 
 # ============================================================
@@ -1015,24 +1055,27 @@ def _restore_rot(pb, saved):
         pb.rotation_euler = val.copy()
 
 
-def _apply_world_rotation_to_root(arm, root_pb, q_world, root_base_rot):
+def _apply_world_rotation_to_bone(arm, pb, q_world, base_rot):
     """
-    Applies a world-space rotation q_world to root_pb, starting from root_base_rot.
+    Applies a world-space rotation q_world to pb, starting from base_rot.
     """
     arm_q = arm.matrix_world.to_quaternion()
     arm_q_inv = arm_q.inverted()
     local_q = arm_q_inv @ q_world @ arm_q
 
-    mode, base_val = root_base_rot
+    mode, base_val = base_rot
     if mode == 'QUATERNION':
-        root_pb.rotation_quaternion = _quat_mul(local_q, base_val).normalized()
+        pb.rotation_quaternion = _quat_mul(local_q, base_val).normalized()
     elif mode == 'AXIS_ANGLE':
         base_q = Quaternion((base_val[1], base_val[2], base_val[3]), base_val[0])
         res_q = _quat_mul(local_q, base_q).normalized()
-        root_pb.rotation_axis_angle = (res_q.angle, res_q.axis.x, res_q.axis.y, res_q.axis.z)
+        pb.rotation_axis_angle = (res_q.angle, res_q.axis.x, res_q.axis.y, res_q.axis.z)
     else:
         m = local_q.to_matrix() @ Euler(base_val, mode).to_matrix()
-        root_pb.rotation_euler = m.to_euler(mode)
+        pb.rotation_euler = m.to_euler(mode)
+
+
+_apply_world_rotation_to_root = _apply_world_rotation_to_bone
 
 
 # ============================================================
@@ -1095,6 +1138,7 @@ def _unpin_all_live(context, arm=None):
 # ============================================================
 
 def run_bake(context, is_preview=False):
+    global _preview_rest_state
     s = context.scene.ik_path_mvp
 
     if s.frame_end <= s.frame_start:
@@ -1135,6 +1179,8 @@ def run_bake(context, is_preview=False):
         frame = s.frame_start + int(round(t * frame_count))
         key_specs.append((frame, t))
 
+    cur_playhead_frame = context.scene.frame_current
+
     # ------------------------------------------------
     # Режим Pose Mode: контроллер = кость
     # ------------------------------------------------
@@ -1146,50 +1192,56 @@ def run_bake(context, is_preview=False):
         if not pb:
             return ('CANCELLED', f"Bone not found: {s.effector_bone}")
 
-        chain, excluded = get_chain_for(arm, pb, s)
+        # Check if we have valid cached preview rest state
+        cache_valid = (
+            is_preview
+            and bool(_preview_rest_state)
+            and _preview_rest_state.get('arm_name') == arm.name
+            and _preview_rest_state.get('bone_name') == pb.name
+            and _preview_rest_state.get('frame_start') == s.frame_start
+            and _preview_rest_state.get('user_root_bone') == s.root_bone
+            and _preview_rest_state.get('user_body_bone') == s.body_bone
+            and _preview_rest_state.get('solve_mode') == s.solve_mode
+        )
 
-        chain_names = [b.name for b in chain]
+        if not cache_valid:
+            # Set playhead to frame_start to capture true initial rest state
+            context.scene.frame_set(s.frame_start)
+            context.view_layer.update()
 
-        others = []
+            chain, excluded = get_chain_for(arm, pb, s)
+            others = []
+            if s.preserve_offsets:
+                for b in arm.pose.bones:
+                    if b in chain:
+                        continue
+                    if _pose_bone_selected(b):
+                        others.append(b)
 
-        if s.preserve_offsets:
-            for b in arm.pose.bones:
-                if b in chain:
-                    continue
-                if _pose_bone_selected(b):
-                    others.append(b)
+            deltas = {b.name: (pb.matrix.inverted() @ b.matrix).copy() for b in others}
 
-        deltas = {b: pb.matrix.inverted() @ b.matrix for b in others}
+            # Collect pinned bones (lock in world space)
+            pinned_bones_list = []
+            if s.pinned_bones.strip():
+                for b_name in s.pinned_bones.split(','):
+                    bn = b_name.strip()
+                    if bn and bn in arm.pose.bones:
+                        pinned_bones_list.append(arm.pose.bones[bn])
+            for pb_cand in arm.pose.bones:
+                if pb_cand.constraints.get('IKPath_Pin') and pb_cand not in pinned_bones_list:
+                    pinned_bones_list.append(pb_cand)
 
-        inv = arm.matrix_world.inverted()
+            pinned_matrices = {}
+            for b in pinned_bones_list:
+                c = b.constraints.get('IKPath_Pin')
+                if c and c.target:
+                    pinned_matrices[b.name] = c.target.matrix_world.copy()
+                else:
+                    pinned_matrices[b.name] = (arm.matrix_world @ b.matrix).copy()
 
-        # Collect pinned bones (lock in world space)
-        pinned_bones_list = []
-        if s.pinned_bones.strip():
-            for b_name in s.pinned_bones.split(','):
-                bn = b_name.strip()
-                if bn and bn in arm.pose.bones:
-                    pinned_bones_list.append(arm.pose.bones[bn])
-        for pb_cand in arm.pose.bones:
-            if pb_cand.constraints.get('IKPath_Pin') and pb_cand not in pinned_bones_list:
-                pinned_bones_list.append(pb_cand)
-
-        pinned_matrices = {}
-        for b in pinned_bones_list:
-            c = b.constraints.get('IKPath_Pin')
-            if c and c.target:
-                pinned_matrices[b] = c.target.matrix_world.copy()
-            else:
-                pinned_matrices[b] = (arm.matrix_world @ b.matrix).copy()
-
-        # =============================================
-        # BODY DRAG  —  Direct head placement + Root Follow with Slack
-        # =============================================
-        if s.solve_mode == 'BODY_DRAG':
             start_matrix_world = (arm.matrix_world @ pb.matrix).copy()
             start_translation = start_matrix_world.translation.copy()
 
-            # Find root bone for whole-body carrier
             root_pb = None
             if s.root_bone.strip():
                 root_pb = arm.pose.bones.get(s.root_bone.strip())
@@ -1200,12 +1252,14 @@ def run_bake(context, is_preview=False):
             root_base_rot = _capture_rot(root_pb) if root_pb else None
             root_world_start = (arm.matrix_world @ root_pb.matrix).translation.copy() if root_pb else None
 
-            # Find natural unstretched reach and body anchor (spine/chest)
+            body_pb = _find_body_bone(arm, root_pb, s)
+            body_start = body_pb.location.copy() if body_pb else None
+            body_base_rot = _capture_rot(body_pb) if body_pb else None
+
             max_reach, base_pb = _get_chain_reach_and_base(arm, pb, s.max_reach)
             base_world_start = (arm.matrix_world @ base_pb.matrix).translation.copy() if base_pb else None
 
-            # Legs auto-drag / dangling setup
-            leg_controllers = []
+            leg_controllers_data = []
             if s.leg_dangle:
                 for b_cand in arm.pose.bones:
                     nm = b_cand.name.lower()
@@ -1220,26 +1274,86 @@ def run_bake(context, is_preview=False):
                             f_start_w = (arm.matrix_world @ b_cand.matrix).translation.copy()
                             h_start_w = (arm.matrix_world @ hip_cand.matrix).translation.copy() if hip_cand else None
                             leg_l = (f_start_w - h_start_w).length if h_start_w else 0.46
-                            leg_controllers.append({
-                                'bone': b_cand,
-                                'hip': hip_cand,
+                            leg_controllers_data.append({
+                                'bone_name': b_cand.name,
+                                'hip_name': hip_cand.name if hip_cand else None,
                                 'foot_start_w': f_start_w,
                                 'hip_start_w': h_start_w,
                                 'leg_len': leg_l,
                                 'foot_start_m': (arm.matrix_world @ b_cand.matrix).copy(),
                             })
 
-            print(
-                f"[IKPath BODY_DRAG] max_reach={max_reach:.4f}, "
-                f"base={base_pb.name if base_pb else 'None'}, "
-                f"root={root_pb.name if root_pb else 'None'}, "
-                f"pinned={[b.name for b in pinned_bones_list]}, "
-                f"legs={[l['bone'].name for l in leg_controllers]}"
-            )
+            if is_preview:
+                _preview_rest_state = {
+                    'arm_name': arm.name,
+                    'bone_name': pb.name,
+                    'frame_start': s.frame_start,
+                    'user_root_bone': s.root_bone,
+                    'user_body_bone': s.body_bone,
+                    'solve_mode': s.solve_mode,
+                    'start_matrix_world': start_matrix_world,
+                    'start_translation': start_translation,
+                    'chain_names': [b.name for b in chain],
+                    'deltas': deltas,
+                    'pinned_matrices': pinned_matrices,
+                    'root_name': root_pb.name if root_pb else None,
+                    'root_start': root_start,
+                    'root_base_rot': root_base_rot,
+                    'root_world_start': root_world_start,
+                    'body_name': body_pb.name if body_pb else None,
+                    'body_start': body_start,
+                    'body_base_rot': body_base_rot,
+                    'base_name': base_pb.name if base_pb else None,
+                    'base_world_start': base_world_start,
+                    'max_reach': max_reach,
+                    'leg_controllers': leg_controllers_data,
+                }
+        else:
+            # Reconstruct from pristine cached preview rest state
+            st = _preview_rest_state
+            start_matrix_world = st['start_matrix_world'].copy()
+            start_translation = st['start_translation'].copy()
+            deltas = st['deltas']
+            pinned_matrices = st['pinned_matrices']
+            root_pb = arm.pose.bones.get(st['root_name']) if st.get('root_name') else None
+            root_start = st['root_start'].copy() if st.get('root_start') is not None else None
+            root_base_rot = st['root_base_rot']
+            root_world_start = st['root_world_start'].copy() if st.get('root_world_start') is not None else None
+            body_pb = arm.pose.bones.get(st['body_name']) if st.get('body_name') else None
+            body_start = st['body_start'].copy() if st.get('body_start') is not None else None
+            body_base_rot = st['body_base_rot']
+            base_world_start = st['base_world_start'].copy() if st.get('base_world_start') is not None else None
+            max_reach = s.max_reach if s.max_reach > 0.0 else st['max_reach']
+            leg_controllers_data = st['leg_controllers']
 
+        inv = arm.matrix_world.inverted()
+
+        # Build active leg objects
+        leg_controllers = []
+        if s.leg_dangle:
+            for ld in leg_controllers_data:
+                b_cand = arm.pose.bones.get(ld['bone_name'])
+                hip_cand = arm.pose.bones.get(ld['hip_name']) if ld.get('hip_name') else None
+                if b_cand:
+                    leg_controllers.append({
+                        'bone': b_cand,
+                        'hip': hip_cand,
+                        'foot_start_w': ld['foot_start_w'].copy(),
+                        'hip_start_w': ld['hip_start_w'].copy() if ld.get('hip_start_w') is not None else None,
+                        'leg_len': ld['leg_len'],
+                        'foot_start_m': ld['foot_start_m'].copy(),
+                    })
+
+        # Build active deltas & pinned maps
+        deltas_map = {arm.pose.bones[bn]: d for bn, d in deltas.items() if bn in arm.pose.bones}
+        pinned_map = {arm.pose.bones[bn]: m for bn, m in pinned_matrices.items() if bn in arm.pose.bones}
+
+        # =============================================
+        # BODY DRAG  —  Direct head placement + Root Follow with Slack
+        # =============================================
+        if s.solve_mode == 'BODY_DRAG':
             arm_scale = arm.matrix_world.to_scale()
             smin = min((abs(x) for x in arm_scale if abs(x) > 1e-9), default=1.0)
-
             n_keys = len(key_specs)
 
             for i, (frame, u) in enumerate(key_specs):
@@ -1249,7 +1363,6 @@ def run_bake(context, is_preview=False):
                     head_pos = start_translation.copy()
                 else:
                     p = eval_polyline(points, lengths, total, u)
-
                     if s.path_mode == 'RELATIVE':
                         pos = start_translation + (p - path_origin)
                     else:
@@ -1257,23 +1370,18 @@ def run_bake(context, is_preview=False):
 
                     # --- 1. Calculate Slack & Pull Vector ---
                     body_move_world = Vector((0.0, 0.0, 0.0))
-
                     if base_world_start is not None and max_reach > 1e-4:
                         v = pos - base_world_start
                         cur_dist = v.length
-
                         if cur_dist > max_reach:
-                            # Head has extended beyond natural unstretched neck length!
                             excess = (cur_dist - max_reach) * s.body_follow
                             pull_dir = v.normalized()
                             body_move_world = pull_dir * excess
-
                             if s.root_max_translate > 0.0:
                                 cap = s.root_max_translate / smin
                                 if body_move_world.length > cap:
                                     body_move_world = body_move_world * (cap / body_move_world.length)
 
-                    # Determine head position first for tension vector
                     if base_world_start is not None and max_reach > 1e-4 and s.limit_stretch:
                         current_base = base_world_start + body_move_world
                         to_target = pos - current_base
@@ -1284,7 +1392,7 @@ def run_bake(context, is_preview=False):
                     else:
                         head_pos = pos
 
-                # Move and rotate root
+                # 1. ROOT BONE: Translation ONLY, rotation strictly neutral/horizontal (ZERO tilt)
                 if root_pb is not None:
                     if body_move_world.length > 1e-6:
                         root_pb.location = root_start + _world_delta_to_bone_location(
@@ -1293,12 +1401,20 @@ def run_bake(context, is_preview=False):
                     else:
                         root_pb.location = root_start.copy()
 
-                    # Rotate/tilt root towards pull direction ONLY when body is actually dragged (and not frame 0)
+                    if root_base_rot is not None:
+                        _restore_rot(root_pb, root_base_rot)
+
+                    context.view_layer.update()
+                    keyframe_pose_bone_location(root_pb, frame)
+                    keyframe_pose_bone_rotation(root_pb, frame)
+
+                # 2. BODY/TORSO BONE: Lean towards pull direction (keeps root and feet flat)
+                if body_pb is not None and body_base_rot is not None:
                     if (
                         s.body_rotate != 0.0
-                        and root_base_rot is not None
                         and body_move_world.length > 1e-4
                         and i > 0
+                        and root_world_start is not None
                     ):
                         current_root_world = root_world_start + body_move_world
                         tension_vec = head_pos - current_root_world
@@ -1309,27 +1425,25 @@ def run_bake(context, is_preview=False):
                                 q_lean = q_diff.inverted() if s.body_rotate > 0 else q_diff
                                 factor = min(1.0, abs(s.body_rotate) * 2.0)
                                 q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_lean, factor)
-                                _apply_world_rotation_to_root(arm, root_pb, q_applied, root_base_rot)
+                                _apply_world_rotation_to_bone(arm, body_pb, q_applied, body_base_rot)
                             else:
-                                _restore_rot(root_pb, root_base_rot)
+                                _restore_rot(body_pb, body_base_rot)
                         else:
-                            _restore_rot(root_pb, root_base_rot)
+                            _restore_rot(body_pb, body_base_rot)
                     else:
-                        if root_base_rot is not None:
-                            _restore_rot(root_pb, root_base_rot)
+                        _restore_rot(body_pb, body_base_rot)
 
                     context.view_layer.update()
-                    keyframe_pose_bone_location(root_pb, frame)
-                    keyframe_pose_bone_rotation(root_pb, frame)
+                    keyframe_pose_bone_rotation(body_pb, frame)
 
-                # Head placement
+                # 3. Head placement
                 m = start_matrix_world.copy()
                 m.translation = head_pos
                 pb.matrix = inv @ m
                 context.view_layer.update()
                 keyframe_pose_bone(pb, frame)
 
-                # Legs auto-drag / dangling (Two-phase: Grounded diagonal stance -> Trailing lift)
+                # 4. Legs auto-drag / dangling (Two-phase: Grounded diagonal stance -> Trailing lift)
                 for leg in leg_controllers:
                     b_cand = leg['bone']
                     hip = leg['hip']
@@ -1344,7 +1458,6 @@ def run_bake(context, is_preview=False):
                         cur_leg_dist = v_leg.length
                         max_ground_dist = leg_len * s.leg_stretch_limit
 
-                        # Phase 1: Grounded (standing or stretching diagonally to reach ground)
                         if (
                             i == 0
                             or body_move_world.length <= 1e-4
@@ -1353,10 +1466,8 @@ def run_bake(context, is_preview=False):
                             m_f = f_start_m.copy()
                             m_f.translation = f_start_w
                         else:
-                            # Phase 2: Lifted & Trailing behind hip along v_leg towards original ground point
                             foot_dir = v_leg.normalized()
                             t_pos = h_cur_w + foot_dir * leg_len
-                            # Smoothly transition toe tilt as foot lifts
                             lift = min(1.0, (cur_leg_dist - leg_len) / 0.15) if cur_leg_dist > leg_len else 0.0
                             pitch = radians(-55.0 * s.leg_dangle_amount * lift)
                             rot_down = Quaternion((1.0, 0.0, 0.0), pitch)
@@ -1367,31 +1478,37 @@ def run_bake(context, is_preview=False):
                         context.view_layer.update()
                         keyframe_pose_bone(b_cand, frame)
 
-                # Apply pinned bones (lock in world space)
-                for b_pin, m_w in pinned_matrices.items():
+                # 5. Apply pinned bones (lock in world space)
+                for b_pin, m_w in pinned_map.items():
                     b_pin.matrix = inv @ m_w
                 context.view_layer.update()
-                for b_pin in pinned_matrices.keys():
+                for b_pin in pinned_map.keys():
                     keyframe_pose_bone(b_pin, frame)
 
-                # Preserve offsets of other selected bones
-                for b, d in deltas.items():
-                    if b not in pinned_matrices:
+                # 6. Preserve offsets of other selected bones
+                for b, d in deltas_map.items():
+                    if b not in pinned_map:
                         b.matrix = pb.matrix @ d
                 context.view_layer.update()
-
-                for b in deltas.keys():
-                    if b not in pinned_matrices:
+                for b in deltas_map.keys():
+                    if b not in pinned_map:
                         keyframe_pose_bone(b, frame)
 
             set_smooth_keys_obj(arm)
-            context.scene.frame_set(s.frame_start)
+            if is_preview:
+                context.scene.frame_set(cur_playhead_frame)
+            else:
+                context.scene.frame_set(s.frame_start)
+                clear_preview_rest_state()
+            context.view_layer.update()
 
             msg = f"Body Drag: baked head {pb.name}"
             if root_pb is not None:
                 msg += f" + root {root_pb.name} (reach={max_reach:.2f}, follow={s.body_follow:.2f})"
-            if pinned_matrices:
-                msg += f", {len(pinned_matrices)} pinned"
+            if body_pb is not None:
+                msg += f" + body lean {body_pb.name}"
+            if pinned_map:
+                msg += f", {len(pinned_map)} pinned"
             msg += f", {key_count} keys"
 
             if not is_preview and s.delete_path_after_bake:
@@ -1406,9 +1523,6 @@ def run_bake(context, is_preview=False):
             return ('FINISHED', msg)
         # DIRECT
         # =============================================
-        start_matrix_world = (arm.matrix_world @ pb.matrix).copy()
-        start_translation = start_matrix_world.translation.copy()
-
         for i, (frame, u) in enumerate(key_specs):
             if i == 0:
                 pos = start_translation.copy()
@@ -1425,29 +1539,33 @@ def run_bake(context, is_preview=False):
             pb.matrix = inv @ m
             context.view_layer.update()
 
-            for b, d in deltas.items():
-                if b not in pinned_matrices:
+            for b, d in deltas_map.items():
+                if b not in pinned_map:
                     b.matrix = pb.matrix @ d
 
-            for b_pin, m_w in pinned_matrices.items():
+            for b_pin, m_w in pinned_map.items():
                 b_pin.matrix = inv @ m_w
 
             context.view_layer.update()
 
             keyframe_pose_bone(pb, frame)
 
-            for b in deltas.keys():
-                if b not in pinned_matrices:
+            for b in deltas_map.keys():
+                if b not in pinned_map:
                     keyframe_pose_bone(b, frame)
 
-            for b_pin in pinned_matrices.keys():
+            for b_pin in pinned_map.keys():
                 keyframe_pose_bone(b_pin, frame)
 
         set_smooth_keys_obj(arm)
+        if is_preview:
+            context.scene.frame_set(cur_playhead_frame)
+        else:
+            context.scene.frame_set(s.frame_start)
+            clear_preview_rest_state()
+        context.view_layer.update()
 
-        context.scene.frame_set(s.frame_start)
-
-        msg = f"Direct baked bone {pb.name} (+{len(deltas)} bones), {key_count} keys"
+        msg = f"Direct baked bone {pb.name} (+{len(deltas_map)} bones), {key_count} keys"
 
         if not is_preview and s.delete_path_after_bake:
             bpy.data.objects.remove(path_obj, do_unlink=True)
@@ -1531,7 +1649,10 @@ def run_bake(context, is_preview=False):
     for obj in offsets.keys():
         set_smooth_keys_obj(obj)
 
-    context.scene.frame_set(s.frame_start)
+    if is_preview:
+        context.scene.frame_set(cur_playhead_frame)
+    else:
+        context.scene.frame_set(s.frame_start)
 
     msg = f"Baked {len(selected)} object(s), {key_count} keys"
 
@@ -1574,12 +1695,14 @@ class IKPATHMVP_OT_capture_controller(bpy.types.Operator):
 
             s.effector_object = obj.name
             s.effector_bone = pb.name
+            clear_preview_rest_state()
 
             self.report({'INFO'}, f"Controller: {obj.name} / {pb.name}")
             return {'FINISHED'}
 
         s.effector_object = obj.name
         s.effector_bone = ""
+        clear_preview_rest_state()
 
         self.report({'INFO'}, f"Controller object: {obj.name}")
         return {'FINISHED'}
@@ -1594,6 +1717,7 @@ class IKPATHMVP_OT_clear_controller(bpy.types.Operator):
         s = context.scene.ik_path_mvp
         s.effector_object = ""
         s.effector_bone = ""
+        clear_preview_rest_state()
         self.report({'INFO'}, "Controller cleared")
         return {'FINISHED'}
 
@@ -1776,6 +1900,7 @@ class IKPATHMVP_OT_draw_path(bpy.types.Operator):
         path_obj = self._preview
         self._preview = None
 
+        clear_preview_rest_state()
         s.path_name = path_obj.name
         s.is_preview = True
 
@@ -1829,6 +1954,7 @@ class IKPATHMVP_OT_create_path(bpy.types.Operator):
             points=points,
         )
 
+        clear_preview_rest_state()
         s.path_name = path_obj.name
 
         self.report({'INFO'}, f"Created path: {path_obj.name}")
@@ -1888,6 +2014,10 @@ class IKPATHMVP_OT_debug(bpy.types.Operator):
             lines.append(
                 f"Root: bone='{s.root_bone or '(auto)'}', "
                 f"max_translate={s.root_max_translate:.3f}"
+            )
+            lines.append(
+                f"Body: bone='{s.body_bone or '(auto)'}', "
+                f"lean={s.body_rotate:.2f}"
             )
 
         arm = bpy.data.objects.get(s.effector_object)
@@ -2021,12 +2151,14 @@ class IKPATHMVP_OT_apply_bake(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        global _preview_rest_state
         s = context.scene.ik_path_mvp
         path_obj = bpy.data.objects.get(s.path_name)
         if path_obj and s.delete_path_after_bake:
             bpy.data.objects.remove(path_obj, do_unlink=True)
             s.path_name = ""
 
+        clear_preview_rest_state()
         s.is_preview = False
         self.report({'INFO'}, "Animation finalized and baked!")
         return {'FINISHED'}
@@ -2039,6 +2171,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        global _preview_rest_state
         s = context.scene.ik_path_mvp
         path_obj = bpy.data.objects.get(s.path_name)
         if path_obj:
@@ -2046,16 +2179,42 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
             s.path_name = ""
 
         arm = bpy.data.objects.get(s.effector_object)
-        if arm and arm.type == 'ARMATURE' and arm.animation_data and arm.animation_data.action:
-            action = arm.animation_data.action
-            fstart = s.frame_start
-            fend = s.frame_end
-            for fcurve in list(action.fcurves):
-                pts_to_del = [kp for kp in fcurve.keyframe_points if fstart <= kp.co.x <= fend]
-                for kp in pts_to_del:
-                    fcurve.keyframe_points.remove(kp)
-            context.scene.frame_set(s.frame_start)
+        if arm and arm.type == 'ARMATURE':
+            if arm.animation_data and arm.animation_data.action:
+                action = arm.animation_data.action
+                fstart = s.frame_start
+                fend = s.frame_end
+                for fcurve in _iter_action_fcurves(action):
+                    kps = fcurve.keyframe_points
+                    for idx in range(len(kps) - 1, -1, -1):
+                        if fstart <= kps[idx].co.x <= fend:
+                            kps.remove(kps[idx])
 
+            # Restore pristine rest pose if available
+            if _preview_rest_state:
+                inv = arm.matrix_world.inverted()
+                if _preview_rest_state.get('root_name') and _preview_rest_state.get('root_start') is not None:
+                    rpb = arm.pose.bones.get(_preview_rest_state['root_name'])
+                    if rpb:
+                        rpb.location = _preview_rest_state['root_start'].copy()
+                        _restore_rot(rpb, _preview_rest_state['root_base_rot'])
+                if _preview_rest_state.get('body_name') and _preview_rest_state.get('body_base_rot') is not None:
+                    bpb = arm.pose.bones.get(_preview_rest_state['body_name'])
+                    if bpb:
+                        _restore_rot(bpb, _preview_rest_state['body_base_rot'])
+                if _preview_rest_state.get('bone_name') and _preview_rest_state.get('start_matrix_world') is not None:
+                    epb = arm.pose.bones.get(_preview_rest_state['bone_name'])
+                    if epb:
+                        epb.matrix = inv @ _preview_rest_state['start_matrix_world']
+                for leg in _preview_rest_state.get('leg_controllers', []):
+                    lb = arm.pose.bones.get(leg['bone_name'])
+                    if lb and 'foot_start_m' in leg:
+                        lb.matrix = inv @ leg['foot_start_m']
+
+            context.scene.frame_set(s.frame_start)
+            context.view_layer.update()
+
+        clear_preview_rest_state()
         s.is_preview = False
         self.report({'INFO'}, "Preview discarded")
         return {'FINISHED'}
@@ -2066,7 +2225,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.0"
+    bl_label = "IK Path MVP v0.5.1"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2131,6 +2290,7 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
             box.prop(s, "limit_stretch")
             box.prop(s, "max_reach")
             box.prop(s, "root_bone")
+            box.prop(s, "body_bone")
             box.prop(s, "root_max_translate")
 
         if s.solve_mode != 'DIRECT':
