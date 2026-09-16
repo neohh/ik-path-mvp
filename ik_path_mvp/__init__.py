@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 5),
+    "version": (0, 5, 6),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Direct single-bone isolation, non-destructive preview cancel, inverted body lean",
+    "description": "Draw path + live preview. World-space trajectory locks (замочки), non-destructive cancel, direct bone isolation",
     "category": "Animation",
 }
 
@@ -220,6 +220,13 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         name="Pinned Bones",
         description="Comma-separated list of bones locked in world space during bake",
         default="",
+    )
+
+    locked_world_bones: bpy.props.StringProperty(
+        name="World Locked Bones",
+        description="Comma-separated list of bones whose world-space animation trajectory is locked and compensated when animating other bones",
+        default="",
+        update=_on_setting_updated,
     )
 
     max_reach: bpy.props.FloatProperty(
@@ -1193,6 +1200,40 @@ def _unpin_all_live(context, arm=None):
             pass
 
 
+def _get_locked_world_bones(s, arm, exclude_bone=None):
+    if not arm or arm.type != 'ARMATURE' or not s.locked_world_bones.strip():
+        return []
+    res = []
+    names = [n.strip() for n in s.locked_world_bones.split(',') if n.strip()]
+    for name in names:
+        if exclude_bone and name == exclude_bone:
+            continue
+        pb = arm.pose.bones.get(name)
+        if pb and pb not in res:
+            res.append(pb)
+    return res
+
+
+def _capture_world_trajectories(context, arm, locked_bones, frames):
+    trajectories = {b.name: {} for b in locked_bones}
+    start_matrices = {b.name: (arm.matrix_world @ b.matrix).copy() for b in locked_bones}
+    if not locked_bones or not frames:
+        return trajectories, start_matrices
+
+    cur_f = context.scene.frame_current
+    try:
+        for f in frames:
+            context.scene.frame_set(f)
+            context.view_layer.update()
+            for b in locked_bones:
+                trajectories[b.name][f] = (arm.matrix_world @ b.matrix).copy()
+    finally:
+        context.scene.frame_set(cur_f)
+        context.view_layer.update()
+
+    return trajectories, start_matrices
+
+
 # ============================================================
 # Bake core
 # ============================================================
@@ -1294,6 +1335,18 @@ def run_bake(context, is_preview=False):
             else:
                 pinned_matrices[b] = (arm.matrix_world @ b.matrix).copy()
 
+        # Collect world-locked bones (compensation across frames)
+        locked_bones = _get_locked_world_bones(s, arm, exclude_bone=pb.name)
+        frames_list = [frame for frame, u in key_specs]
+
+        if is_preview and _preview_rest_state is not None and 'world_trajectories' in _preview_rest_state:
+            world_trajectories = _preview_rest_state['world_trajectories']
+            locked_start_matrices = _preview_rest_state.get('locked_start_matrices', {})
+        else:
+            world_trajectories, locked_start_matrices = _capture_world_trajectories(
+                context, arm, locked_bones, frames_list
+            )
+
         # =============================================
         # BODY DRAG  —  Direct head placement + Root Follow with Slack
         # =============================================
@@ -1356,6 +1409,8 @@ def run_bake(context, is_preview=False):
                     bones_affected.append(leg['bone'].name)
                 for b in pinned_matrices:
                     bones_affected.append(b.name)
+                for b_name in world_trajectories.keys():
+                    bones_affected.append(b_name)
                 bones_affected = list(dict.fromkeys(bones_affected))
                 fcurve_backup = _backup_action_keyframes(arm, bones_affected, s.frame_start, s.frame_end)
 
@@ -1364,6 +1419,8 @@ def run_bake(context, is_preview=False):
                     'bone_name': pb.name,
                     'bones_affected': bones_affected,
                     'fcurve_backup': fcurve_backup,
+                    'world_trajectories': world_trajectories,
+                    'locked_start_matrices': locked_start_matrices,
                     'start_matrix_world': start_matrix_world.copy(),
                     'start_translation': start_translation.copy(),
                     'root_name': root_pb.name if root_pb else None,
@@ -1568,6 +1625,15 @@ def run_bake(context, is_preview=False):
                     if b not in pinned_matrices:
                         keyframe_pose_bone(b, frame)
 
+                # Apply World Trajectory Compensation for locked bones
+                for b_name, f_map in world_trajectories.items():
+                    if frame in f_map:
+                        lb = arm.pose.bones.get(b_name)
+                        if lb:
+                            lb.matrix = inv @ f_map[frame]
+                            context.view_layer.update()
+                            keyframe_pose_bone(lb, frame)
+
             set_smooth_keys_obj(arm)
             if is_preview:
                 context.scene.frame_set(cur_playhead_frame)
@@ -1582,6 +1648,8 @@ def run_bake(context, is_preview=False):
                 msg += f" + body lean {body_pb.name}"
             if pinned_matrices:
                 msg += f", {len(pinned_matrices)} pinned"
+            if world_trajectories:
+                msg += f", {len(world_trajectories)} locked"
             msg += f", {key_count} keys"
 
             if not is_preview and s.delete_path_after_bake:
@@ -1601,12 +1669,17 @@ def run_bake(context, is_preview=False):
 
         if is_preview and _preview_rest_state is None:
             bones_affected = [pb.name]
+            for b_name in world_trajectories.keys():
+                bones_affected.append(b_name)
+            bones_affected = list(dict.fromkeys(bones_affected))
             fcurve_backup = _backup_action_keyframes(arm, bones_affected, s.frame_start, s.frame_end)
             _preview_rest_state = {
                 'mode': 'DIRECT',
                 'bone_name': pb.name,
                 'bones_affected': bones_affected,
                 'fcurve_backup': fcurve_backup,
+                'world_trajectories': world_trajectories,
+                'locked_start_matrices': locked_start_matrices,
                 'start_matrix_world': start_matrix_world.copy(),
                 'start_translation': start_translation.copy(),
             }
@@ -1632,6 +1705,15 @@ def run_bake(context, is_preview=False):
 
             keyframe_pose_bone(pb, frame)
 
+            # Apply World Trajectory Compensation for locked bones
+            for b_name, f_map in world_trajectories.items():
+                if frame in f_map:
+                    lb = arm.pose.bones.get(b_name)
+                    if lb:
+                        lb.matrix = inv @ f_map[frame]
+                        context.view_layer.update()
+                        keyframe_pose_bone(lb, frame)
+
         set_smooth_keys_obj(arm)
         if is_preview:
             context.scene.frame_set(cur_playhead_frame)
@@ -1639,7 +1721,10 @@ def run_bake(context, is_preview=False):
             context.scene.frame_set(s.frame_start)
         context.view_layer.update()
 
-        msg = f"Direct baked bone {pb.name}, {key_count} keys"
+        msg = f"Direct baked bone {pb.name}"
+        if world_trajectories:
+            msg += f" ({len(world_trajectories)} world locked)"
+        msg += f", {key_count} keys"
 
         if not is_preview and s.delete_path_after_bake:
             bpy.data.objects.remove(path_obj, do_unlink=True)
@@ -2217,6 +2302,63 @@ class IKPATHMVP_OT_unpin_bones(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IKPATHMVP_OT_toggle_world_lock(bpy.types.Operator):
+    bl_idname = "ikpathmvp.toggle_world_lock"
+    bl_label = "Lock/Unlock Selected Bone"
+    bl_description = "Lock selected bone's world trajectory so it stays in place when parent bones move"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        pb = context.active_pose_bone
+        if not pb:
+            self.report({'WARNING'}, "Select a pose bone in Pose Mode first")
+            return {'CANCELLED'}
+
+        cur = [b.strip() for b in s.locked_world_bones.split(',') if b.strip()]
+        if pb.name in cur:
+            cur.remove(pb.name)
+            s.locked_world_bones = ", ".join(cur)
+            self.report({'INFO'}, f"Removed world lock from '{pb.name}'")
+        else:
+            cur.append(pb.name)
+            s.locked_world_bones = ", ".join(cur)
+            self.report({'INFO'}, f"Locked '{pb.name}' in world space")
+
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_remove_world_lock(bpy.types.Operator):
+    bl_idname = "ikpathmvp.remove_world_lock"
+    bl_label = "Remove World Lock"
+    bl_description = "Unlock this bone from world space compensation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: bpy.props.StringProperty(name="Bone Name", default="")
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        bn = self.bone_name.strip()
+        cur = [b.strip() for b in s.locked_world_bones.split(',') if b.strip()]
+        if bn in cur:
+            cur.remove(bn)
+            s.locked_world_bones = ", ".join(cur)
+            self.report({'INFO'}, f"Removed world lock from '{bn}'")
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_clear_world_locks(bpy.types.Operator):
+    bl_idname = "ikpathmvp.clear_world_locks"
+    bl_label = "Clear All World Locks"
+    bl_description = "Remove all world space locks"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.ik_path_mvp.locked_world_bones = ""
+        self.report({'INFO'}, "All world locks cleared")
+        return {'FINISHED'}
+
+
 class IKPATHMVP_OT_apply_bake(bpy.types.Operator):
     bl_idname = "ikpathmvp.apply_bake"
     bl_label = "Apply Bake"
@@ -2285,6 +2427,11 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
                     lb = arm.pose.bones.get(leg['bone_name'])
                     if lb and 'foot_start_m' in leg:
                         lb.matrix = inv @ leg['foot_start_m']
+                if _preview_rest_state.get('locked_start_matrices'):
+                    for b_name, m_start in _preview_rest_state['locked_start_matrices'].items():
+                        lb = arm.pose.bones.get(b_name)
+                        if lb:
+                            lb.matrix = inv @ m_start
 
             context.scene.frame_set(s.frame_start)
             context.view_layer.update()
@@ -2300,7 +2447,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.5"
+    bl_label = "IK Path MVP v0.5.6"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2373,14 +2520,33 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
 
         box.prop(s, "path_mode")
 
+        # World Trajectory Locks (Замочки в мире)
+        box = layout.box()
+        box.label(text="World Locks (Замочки в мире)", icon='LOCKED')
+        row = box.row(align=True)
+        row.operator("ikpathmvp.toggle_world_lock", text="Lock / Unlock Selected", icon='PINNED')
+        if s.locked_world_bones.strip():
+            row.operator("ikpathmvp.clear_world_locks", text="Clear All", icon='X')
+
+        locked_list = [b.strip() for b in s.locked_world_bones.split(',') if b.strip()]
+        if locked_list:
+            col = box.column(align=True)
+            for b_name in locked_list:
+                r = col.row(align=True)
+                r.label(text=b_name, icon='BONE_DATA')
+                op = r.operator("ikpathmvp.remove_world_lock", text="", icon='X')
+                op.bone_name = b_name
+        else:
+            box.label(text="No locked bones (select bone & Lock)", icon='INFO')
+
         # Pinned Bones (Lock in World)
         box = layout.box()
-        box.label(text="Pinned Bones (Lock in World)", icon='PINNED')
+        box.label(text="Pinned Bones (Static Lock)", icon='PINNED')
         row = box.row(align=True)
         row.operator("ikpathmvp.pin_bones", text="Pin Selected", icon='RESTRICT_SELECT_OFF')
         row.operator("ikpathmvp.unpin_bones", text="Unpin All", icon='X')
         if s.pinned_bones.strip():
-            box.label(text=f"Locked: {s.pinned_bones}", icon='CHECKMARK')
+            box.label(text=f"Pinned: {s.pinned_bones}", icon='CHECKMARK')
 
         # Chain & Filters
         box = layout.box()
@@ -2433,9 +2599,7 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
             icon='KEYFRAME_HLT'
         )
 
-        layout.separator()
-
-        layout.operator("ikpathmvp.debug", text="Debug Info", icon='CONSOLE')
+        layout.operator("ikpathmvp.debug", text="Debug Info", icon='INFO')
 
 
 # ============================================================
@@ -2481,6 +2645,9 @@ classes = (
     IKPATHMVP_OT_clear_path,
     IKPATHMVP_OT_pin_bones,
     IKPATHMVP_OT_unpin_bones,
+    IKPATHMVP_OT_toggle_world_lock,
+    IKPATHMVP_OT_remove_world_lock,
+    IKPATHMVP_OT_clear_world_locks,
     IKPATHMVP_OT_debug,
     VIEW3D_PT_ikpath_mvp,
     VIEW3D_MT_ikpath_mvp_menu,
