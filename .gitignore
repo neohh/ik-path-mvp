@@ -1,0 +1,13 @@
+﻿# Blender temporary and cache files
+*.blend
+*.blend1
+*.blend2
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Workspace scratch/temp
+extracted/
