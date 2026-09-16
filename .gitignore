@@ -1,4 +1,4 @@
-﻿# Blender temporary and cache files
+# Blender temporary and cache files
 *.blend
 *.blend1
 *.blend2
@@ -11,3 +11,4 @@ Thumbs.db
 
 # Workspace scratch/temp
 extracted/
+*.zip

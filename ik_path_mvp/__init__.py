@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 4, 1),
+    "version": (0, 5, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + bake. Body Drag with Rigify-aware chain filter",
+    "description": "Draw path + live preview. Real constraint bone pinning and two-phase physics",
     "category": "Animation",
 }
 
@@ -16,10 +16,39 @@ from math import radians, degrees
 
 
 # ============================================================
+# Live Settings Update Callback
+# ============================================================
+
+_is_updating = False
+
+def _on_setting_updated(self, context):
+    global _is_updating
+    if _is_updating:
+        return
+    if not hasattr(context, "scene") or not context.scene:
+        return
+    s = getattr(context.scene, "ik_path_mvp", None)
+    if s and getattr(s, "is_preview", False) and s.path_name:
+        path_obj = bpy.data.objects.get(s.path_name)
+        if path_obj:
+            _is_updating = True
+            try:
+                run_bake(context, is_preview=True)
+            finally:
+                _is_updating = False
+
+
+# ============================================================
 # Settings
 # ============================================================
 
 class IKPathMVPSettings(bpy.types.PropertyGroup):
+    is_preview: bpy.props.BoolProperty(
+        name="Preview Active",
+        description="True while user is interactively tweaking sliders before final bake",
+        default=False,
+    )
+
     path_name: bpy.props.StringProperty(
         name="Path Object",
         default="",
@@ -76,6 +105,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
             ('RELATIVE', "Relative", "Path shape is applied as offset from controller start"),
         ),
         default='ABSOLUTE',
+        update=_on_setting_updated,
     )
 
     solve_mode: bpy.props.EnumProperty(
@@ -86,6 +116,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
             ('BODY_DRAG', "Body Drag", "Bend FK controls toward the path, leftover goes to root. No world matrix writes to bones"),
         ),
         default='DIRECT',
+        update=_on_setting_updated,
     )
 
     bend_bones: bpy.props.StringProperty(
@@ -124,6 +155,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         min=0.0,
         max=1000.0,
         soft_max=100.0,
+        update=_on_setting_updated,
     )
 
     body_follow: bpy.props.FloatProperty(
@@ -132,20 +164,23 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         default=1.0,
         min=0.0,
         max=1.0,
+        update=_on_setting_updated,
     )
 
     body_rotate: bpy.props.FloatProperty(
         name="Body Lean",
-        description="Amount of body/root tilt and turn towards the pull direction (0 = none, 1 = full tilt)",
-        default=0.5,
-        min=0.0,
+        description="Amount of body/root tilt towards pull direction (0 = none, positive = lean forward into pull, negative = lean back)",
+        default=0.0,
+        min=-1.0,
         max=1.0,
+        update=_on_setting_updated,
     )
 
     leg_dangle: bpy.props.BoolProperty(
         name="Leg Drag & Dangle",
         description="Legs stay on floor until body lifts higher than leg length, then dangle and trail behind body",
         default=True,
+        update=_on_setting_updated,
     )
 
     leg_dangle_amount: bpy.props.FloatProperty(
@@ -154,6 +189,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         default=0.75,
         min=0.0,
         max=1.0,
+        update=_on_setting_updated,
     )
 
     leg_stretch_limit: bpy.props.FloatProperty(
@@ -162,6 +198,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         default=1.25,
         min=1.0,
         max=2.0,
+        update=_on_setting_updated,
     )
 
     pinned_bones: bpy.props.StringProperty(
@@ -177,12 +214,14 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         min=0.0,
         max=100.0,
         soft_max=10.0,
+        update=_on_setting_updated,
     )
 
     limit_stretch: bpy.props.BoolProperty(
         name="Limit Stretch",
         description="Prevent neck/limb from stretching beyond maximum natural length",
         default=True,
+        update=_on_setting_updated,
     )
 
     chain_max_length: bpy.props.IntProperty(
@@ -206,6 +245,7 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         default=3,
         min=2,
         max=500,
+        update=_on_setting_updated,
     )
 
     smooth_path: bpy.props.BoolProperty(
@@ -280,8 +320,14 @@ def _pose_bone_selected(pb):
     if isinstance(v, bool):
         return v
 
-    bone = getattr(pb, "bone", None)
+    try:
+        spb = bpy.context.selected_pose_bones
+        if spb and pb in spb:
+            return True
+    except Exception:
+        pass
 
+    bone = getattr(pb, "bone", None)
     if bone is not None:
         v = getattr(bone, "select", None)
         if isinstance(v, bool):
@@ -990,10 +1036,65 @@ def _apply_world_rotation_to_root(arm, root_pb, q_world, root_base_rot):
 
 
 # ============================================================
+# Live Bone Pinning Helpers (COPY_TRANSFORMS constraints)
+# ============================================================
+
+def _get_or_create_pin_collection(context):
+    col = bpy.data.collections.get('IKPath_Pins')
+    if not col:
+        col = bpy.data.collections.new('IKPath_Pins')
+        context.scene.collection.children.link(col)
+    return col
+
+
+def _pin_bone_live(context, arm, pb):
+    col = _get_or_create_pin_collection(context)
+    e_name = f"PIN_{arm.name}_{pb.name}"
+    empty = bpy.data.objects.get(e_name)
+    if not empty:
+        empty = bpy.data.objects.new(e_name, None)
+        empty.empty_display_type = 'PLAIN_AXES'
+        empty.empty_display_size = 0.05
+        col.objects.link(empty)
+
+    empty.matrix_world = arm.matrix_world @ pb.matrix
+
+    c = pb.constraints.get('IKPath_Pin')
+    if not c:
+        c = pb.constraints.new('COPY_TRANSFORMS')
+        c.name = 'IKPath_Pin'
+    c.target = empty
+    return empty
+
+
+def _unpin_all_live(context, arm=None):
+    if arm and arm.type == 'ARMATURE':
+        for pb in arm.pose.bones:
+            c = pb.constraints.get('IKPath_Pin')
+            if c:
+                pb.constraints.remove(c)
+    for obj in bpy.data.objects:
+        if obj.type == 'ARMATURE':
+            for pb in obj.pose.bones:
+                c = pb.constraints.get('IKPath_Pin')
+                if c:
+                    pb.constraints.remove(c)
+
+    col = bpy.data.collections.get('IKPath_Pins')
+    if col:
+        for obj in list(col.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        try:
+            bpy.data.collections.remove(col)
+        except Exception:
+            pass
+
+
+# ============================================================
 # Bake core
 # ============================================================
 
-def run_bake(context):
+def run_bake(context, is_preview=False):
     s = context.scene.ik_path_mvp
 
     if s.frame_end <= s.frame_start:
@@ -1069,7 +1170,17 @@ def run_bake(context):
                 bn = b_name.strip()
                 if bn and bn in arm.pose.bones:
                     pinned_bones_list.append(arm.pose.bones[bn])
-        pinned_matrices = {b: (arm.matrix_world @ b.matrix).copy() for b in pinned_bones_list}
+        for pb_cand in arm.pose.bones:
+            if pb_cand.constraints.get('IKPath_Pin') and pb_cand not in pinned_bones_list:
+                pinned_bones_list.append(pb_cand)
+
+        pinned_matrices = {}
+        for b in pinned_bones_list:
+            c = b.constraints.get('IKPath_Pin')
+            if c and c.target:
+                pinned_matrices[b] = c.target.matrix_world.copy()
+            else:
+                pinned_matrices[b] = (arm.matrix_world @ b.matrix).copy()
 
         # =============================================
         # BODY DRAG  —  Direct head placement + Root Follow with Slack
@@ -1184,7 +1295,7 @@ def run_bake(context):
 
                     # Rotate/tilt root towards pull direction ONLY when body is actually dragged (and not frame 0)
                     if (
-                        s.body_rotate > 0.0
+                        s.body_rotate != 0.0
                         and root_base_rot is not None
                         and body_move_world.length > 1e-4
                         and i > 0
@@ -1195,8 +1306,9 @@ def run_bake(context):
                         if tension_vec.length > 1e-4 and v_0.length > 1e-4:
                             q_diff = v_0.normalized().rotation_difference(tension_vec.normalized())
                             if q_diff.angle > 1e-5:
-                                factor = min(1.0, s.body_rotate * 2.0)
-                                q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_diff, factor)
+                                q_lean = q_diff.inverted() if s.body_rotate > 0 else q_diff
+                                factor = min(1.0, abs(s.body_rotate) * 2.0)
+                                q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_lean, factor)
                                 _apply_world_rotation_to_root(arm, root_pb, q_applied, root_base_rot)
                             else:
                                 _restore_rot(root_pb, root_base_rot)
@@ -1282,10 +1394,14 @@ def run_bake(context):
                 msg += f", {len(pinned_matrices)} pinned"
             msg += f", {key_count} keys"
 
-            if s.delete_path_after_bake:
+            if not is_preview and s.delete_path_after_bake:
                 bpy.data.objects.remove(path_obj, do_unlink=True)
                 s.path_name = ""
+                s.is_preview = False
                 msg += ", path deleted"
+            elif is_preview:
+                s.is_preview = True
+                msg += " [Preview active]"
 
             return ('FINISHED', msg)
         # DIRECT
@@ -1333,10 +1449,14 @@ def run_bake(context):
 
         msg = f"Direct baked bone {pb.name} (+{len(deltas)} bones), {key_count} keys"
 
-        if s.delete_path_after_bake:
+        if not is_preview and s.delete_path_after_bake:
             bpy.data.objects.remove(path_obj, do_unlink=True)
             s.path_name = ""
+            s.is_preview = False
             msg += ", path deleted"
+        elif is_preview:
+            s.is_preview = True
+            msg += " [Preview active]"
 
         return ('FINISHED', msg)
 
@@ -1415,10 +1535,14 @@ def run_bake(context):
 
     msg = f"Baked {len(selected)} object(s), {key_count} keys"
 
-    if s.delete_path_after_bake:
+    if not is_preview and s.delete_path_after_bake:
         bpy.data.objects.remove(path_obj, do_unlink=True)
         s.path_name = ""
+        s.is_preview = False
         msg += ", path deleted"
+    elif is_preview:
+        s.is_preview = True
+        msg += " [Preview active]"
 
     return ('FINISHED', msg)
 
@@ -1653,10 +1777,11 @@ class IKPATHMVP_OT_draw_path(bpy.types.Operator):
         self._preview = None
 
         s.path_name = path_obj.name
+        s.is_preview = True
 
-        status, msg = run_bake(context)
+        status, msg = run_bake(context, is_preview=True)
 
-        self.report({'INFO' if status == 'FINISHED' else 'WARNING'}, msg)
+        self.report({'INFO' if status == 'FINISHED' else 'WARNING'}, f"{msg} (Preview active: adjust sliders or click Apply Bake)")
 
         if self._area:
             self._area.tag_redraw()
@@ -1838,7 +1963,7 @@ class IKPATHMVP_OT_debug(bpy.types.Operator):
 class IKPATHMVP_OT_pin_bones(bpy.types.Operator):
     bl_idname = "ikpathmvp.pin_bones"
     bl_label = "Pin Selected"
-    bl_description = "Lock selected pose bones in world space during bake so they will not move"
+    bl_description = "Lock selected pose bones in world space via constraints so they remain frozen when other bones move"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -1848,17 +1973,26 @@ class IKPATHMVP_OT_pin_bones(bpy.types.Operator):
             self.report({'WARNING'}, "Select an armature in Pose Mode first")
             return {'CANCELLED'}
 
+        selected_bones = []
+        if context.selected_pose_bones:
+            selected_bones = [b for b in context.selected_pose_bones if b.id_data == arm]
+        if not selected_bones:
+            selected_bones = [b for b in arm.pose.bones if _pose_bone_selected(b)]
+
         existing = [b.strip() for b in s.pinned_bones.split(',') if b.strip()]
         added = []
-        for pb in arm.pose.bones:
-            if _pose_bone_selected(pb) and pb.name != s.effector_bone and pb.name != s.root_bone:
+        for pb in selected_bones:
+            if pb.name != s.root_bone:
+                _pin_bone_live(context, arm, pb)
                 if pb.name not in existing:
                     existing.append(pb.name)
                     added.append(pb.name)
 
         s.pinned_bones = ", ".join(existing)
+        context.view_layer.update()
+
         if added:
-            self.report({'INFO'}, f"Pinned: {', '.join(added)}")
+            self.report({'INFO'}, f"Pinned in world: {', '.join(added)}")
         else:
             self.report({'INFO'}, "No new bones to pin (select bones first)")
         return {'FINISHED'}
@@ -1867,12 +2001,63 @@ class IKPATHMVP_OT_pin_bones(bpy.types.Operator):
 class IKPATHMVP_OT_unpin_bones(bpy.types.Operator):
     bl_idname = "ikpathmvp.unpin_bones"
     bl_label = "Unpin All"
-    bl_description = "Clear all pinned bones"
+    bl_description = "Clear all pinned bones and remove pin constraints"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        context.scene.ik_path_mvp.pinned_bones = ""
-        self.report({'INFO'}, "All bone pins cleared")
+        s = context.scene.ik_path_mvp
+        arm = bpy.data.objects.get(s.effector_object) or context.active_object
+        _unpin_all_live(context, arm)
+        s.pinned_bones = ""
+        context.view_layer.update()
+        self.report({'INFO'}, "All bone pins and constraints cleared")
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_apply_bake(bpy.types.Operator):
+    bl_idname = "ikpathmvp.apply_bake"
+    bl_label = "Apply Bake"
+    bl_description = "Finalize the animation and delete the preview path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        path_obj = bpy.data.objects.get(s.path_name)
+        if path_obj and s.delete_path_after_bake:
+            bpy.data.objects.remove(path_obj, do_unlink=True)
+            s.path_name = ""
+
+        s.is_preview = False
+        self.report({'INFO'}, "Animation finalized and baked!")
+        return {'FINISHED'}
+
+
+class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
+    bl_idname = "ikpathmvp.cancel_preview"
+    bl_label = "Cancel Preview"
+    bl_description = "Discard preview animation and delete the path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.ik_path_mvp
+        path_obj = bpy.data.objects.get(s.path_name)
+        if path_obj:
+            bpy.data.objects.remove(path_obj, do_unlink=True)
+            s.path_name = ""
+
+        arm = bpy.data.objects.get(s.effector_object)
+        if arm and arm.type == 'ARMATURE' and arm.animation_data and arm.animation_data.action:
+            action = arm.animation_data.action
+            fstart = s.frame_start
+            fend = s.frame_end
+            for fcurve in list(action.fcurves):
+                pts_to_del = [kp for kp in fcurve.keyframe_points if fstart <= kp.co.x <= fend]
+                for kp in pts_to_del:
+                    fcurve.keyframe_points.remove(kp)
+            context.scene.frame_set(s.frame_start)
+
+        s.is_preview = False
+        self.report({'INFO'}, "Preview discarded")
         return {'FINISHED'}
 
 
@@ -1881,7 +2066,7 @@ class IKPATHMVP_OT_unpin_bones(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.4.1"
+    bl_label = "IK Path MVP v0.5.0"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1890,6 +2075,16 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.ik_path_mvp
+
+        # Preview Mode Banner & Actions
+        if s.is_preview:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Preview Active: Tweak sliders below", icon='RESTRICT_VIEW_OFF')
+            row = box.row(align=True)
+            row.scale_y = 1.3
+            row.operator("ikpathmvp.apply_bake", text="Apply Bake", icon='CHECKMARK')
+            row.operator("ikpathmvp.cancel_preview", text="Cancel", icon='CANCEL')
 
         # Draw
         box = layout.box()
@@ -2046,6 +2241,8 @@ classes = (
     IKPATHMVP_OT_draw_path,
     IKPATHMVP_OT_create_path,
     IKPATHMVP_OT_bake,
+    IKPATHMVP_OT_apply_bake,
+    IKPATHMVP_OT_cancel_preview,
     IKPATHMVP_OT_clear_path,
     IKPATHMVP_OT_pin_bones,
     IKPATHMVP_OT_unpin_bones,
