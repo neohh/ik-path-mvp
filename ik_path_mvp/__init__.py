@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 3),
+    "version": (0, 5, 4),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Body/hips lean, horizontal level root, timeline preview stability",
+    "description": "Draw path + live preview. Inverted body lean direction, horizontal level root, timeline preview stability",
     "category": "Animation",
 }
 
@@ -1419,7 +1419,7 @@ def run_bake(context, is_preview=False):
                             q_diff = v_0.normalized().rotation_difference(tension_vec.normalized())
                             if q_diff.angle > 1e-5:
                                 factor = min(1.0, abs(s.body_rotate) * 2.0)
-                                q_lean = q_diff if s.body_rotate > 0 else q_diff.inverted()
+                                q_lean = q_diff.inverted() if s.body_rotate > 0 else q_diff
                                 q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_lean, factor)
                                 _apply_world_rotation_to_bone(arm, body_pb, q_applied, body_base_rot)
                             else:
@@ -2236,7 +2236,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.3"
+    bl_label = "IK Path MVP v0.5.4"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
