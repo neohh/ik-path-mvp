@@ -1,7 +1,7 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
     "description": "Draw path + bake. Body Drag with Rigify-aware chain filter",
@@ -154,6 +154,14 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
         default=0.75,
         min=0.0,
         max=1.0,
+    )
+
+    leg_stretch_limit: bpy.props.FloatProperty(
+        name="Leg Ground Reach",
+        description="Multiplier for how far the leg can reach diagonally while staying on the ground before lifting (1.0 = rest length, 1.25 = stretch out before lifting)",
+        default=1.25,
+        min=1.0,
+        max=2.0,
     )
 
     pinned_bones: bpy.props.StringProperty(
@@ -1090,7 +1098,7 @@ def run_bake(context):
             if s.leg_dangle:
                 for b_cand in arm.pose.bones:
                     nm = b_cand.name.lower()
-                    if ('foot_ik' in nm or ('foot' in nm and 'ik' in nm)) and ('parent' not in nm and 'target' not in nm and 'tweak' not in nm):
+                    if ('foot_ik' in nm or ('foot' in nm and 'ik' in nm)) and ('parent' not in nm and 'target' not in nm and 'tweak' not in nm and 'heel' not in nm and 'roll' not in nm and 'pole' not in nm):
                         if b_cand not in pinned_bones_list and b_cand is not pb and b_cand is not root_pb:
                             side = '.L' if '.l' in nm else ('.R' if '.r' in nm else '')
                             hip_cand = None
@@ -1124,41 +1132,46 @@ def run_bake(context):
             n_keys = len(key_specs)
 
             for i, (frame, u) in enumerate(key_specs):
-                p = eval_polyline(points, lengths, total, u)
-
-                if s.path_mode == 'RELATIVE':
-                    pos = start_translation + (p - path_origin)
+                if i == 0:
+                    pos = start_translation.copy()
+                    body_move_world = Vector((0.0, 0.0, 0.0))
+                    head_pos = start_translation.copy()
                 else:
-                    pos = p.copy()
+                    p = eval_polyline(points, lengths, total, u)
 
-                # --- 1. Calculate Slack & Pull Vector ---
-                body_move_world = Vector((0.0, 0.0, 0.0))
+                    if s.path_mode == 'RELATIVE':
+                        pos = start_translation + (p - path_origin)
+                    else:
+                        pos = p.copy()
 
-                if base_world_start is not None and max_reach > 1e-4:
-                    v = pos - base_world_start
-                    cur_dist = v.length
+                    # --- 1. Calculate Slack & Pull Vector ---
+                    body_move_world = Vector((0.0, 0.0, 0.0))
 
-                    if cur_dist > max_reach:
-                        # Head has extended beyond natural unstretched neck length!
-                        excess = (cur_dist - max_reach) * s.body_follow
-                        pull_dir = v.normalized()
-                        body_move_world = pull_dir * excess
+                    if base_world_start is not None and max_reach > 1e-4:
+                        v = pos - base_world_start
+                        cur_dist = v.length
 
-                        if s.root_max_translate > 0.0:
-                            cap = s.root_max_translate / smin
-                            if body_move_world.length > cap:
-                                body_move_world = body_move_world * (cap / body_move_world.length)
+                        if cur_dist > max_reach:
+                            # Head has extended beyond natural unstretched neck length!
+                            excess = (cur_dist - max_reach) * s.body_follow
+                            pull_dir = v.normalized()
+                            body_move_world = pull_dir * excess
 
-                # Determine head position first for tension vector
-                if base_world_start is not None and max_reach > 1e-4 and s.limit_stretch:
-                    current_base = base_world_start + body_move_world
-                    to_target = pos - current_base
-                    if to_target.length > max_reach:
-                        head_pos = current_base + to_target.normalized() * max_reach
+                            if s.root_max_translate > 0.0:
+                                cap = s.root_max_translate / smin
+                                if body_move_world.length > cap:
+                                    body_move_world = body_move_world * (cap / body_move_world.length)
+
+                    # Determine head position first for tension vector
+                    if base_world_start is not None and max_reach > 1e-4 and s.limit_stretch:
+                        current_base = base_world_start + body_move_world
+                        to_target = pos - current_base
+                        if to_target.length > max_reach:
+                            head_pos = current_base + to_target.normalized() * max_reach
+                        else:
+                            head_pos = pos
                     else:
                         head_pos = pos
-                else:
-                    head_pos = pos
 
                 # Move and rotate root
                 if root_pb is not None:
@@ -1169,8 +1182,13 @@ def run_bake(context):
                     else:
                         root_pb.location = root_start.copy()
 
-                    # Rotate/tilt root towards pull direction (responsive angle)
-                    if s.body_rotate > 0.0 and root_base_rot is not None:
+                    # Rotate/tilt root towards pull direction ONLY when body is actually dragged (and not frame 0)
+                    if (
+                        s.body_rotate > 0.0
+                        and root_base_rot is not None
+                        and body_move_world.length > 1e-4
+                        and i > 0
+                    ):
                         current_root_world = root_world_start + body_move_world
                         tension_vec = head_pos - current_root_world
                         v_0 = start_translation - root_world_start
@@ -1199,7 +1217,7 @@ def run_bake(context):
                 context.view_layer.update()
                 keyframe_pose_bone(pb, frame)
 
-                # Legs auto-drag / dangling
+                # Legs auto-drag / dangling (Two-phase: Grounded diagonal stance -> Trailing lift)
                 for leg in leg_controllers:
                     b_cand = leg['bone']
                     hip = leg['hip']
@@ -1208,18 +1226,28 @@ def run_bake(context):
                     leg_len = leg['leg_len']
                     f_start_m = leg['foot_start_m']
 
-                    if hip and h_start_w and body_move_world.length > 1e-4:
+                    if hip and h_start_w:
                         h_cur_w = (arm.matrix_world @ hip.matrix).translation
-                        dist_to_ground = (h_cur_w - f_start_w).length
+                        v_leg = f_start_w - h_cur_w
+                        cur_leg_dist = v_leg.length
+                        max_ground_dist = leg_len * s.leg_stretch_limit
 
-                        if dist_to_ground <= leg_len:
+                        # Phase 1: Grounded (standing or stretching diagonally to reach ground)
+                        if (
+                            i == 0
+                            or body_move_world.length <= 1e-4
+                            or (cur_leg_dist <= max_ground_dist and (h_cur_w.z - f_start_w.z) <= leg_len)
+                        ):
                             m_f = f_start_m.copy()
                             m_f.translation = f_start_w
                         else:
-                            move_dir = body_move_world.normalized()
-                            hang_dir = (Vector((0.0, 0.0, -1.0)) - move_dir * 0.45).normalized()
-                            t_pos = h_cur_w + hang_dir * leg_len
-                            rot_down = Quaternion((1.0, 0.0, 0.0), radians(-55.0 * s.leg_dangle_amount))
+                            # Phase 2: Lifted & Trailing behind hip along v_leg towards original ground point
+                            foot_dir = v_leg.normalized()
+                            t_pos = h_cur_w + foot_dir * leg_len
+                            # Smoothly transition toe tilt as foot lifts
+                            lift = min(1.0, (cur_leg_dist - leg_len) / 0.15) if cur_leg_dist > leg_len else 0.0
+                            pitch = radians(-55.0 * s.leg_dangle_amount * lift)
+                            rot_down = Quaternion((1.0, 0.0, 0.0), pitch)
                             m_f = f_start_m.copy() @ rot_down.to_matrix().to_4x4()
                             m_f.translation = t_pos
 
@@ -1265,12 +1293,14 @@ def run_bake(context):
         start_matrix_world = (arm.matrix_world @ pb.matrix).copy()
         start_translation = start_matrix_world.translation.copy()
 
-        for frame, u in key_specs:
-            p = eval_polyline(points, lengths, total, u)
-
-            if s.path_mode == 'RELATIVE':
+        for i, (frame, u) in enumerate(key_specs):
+            if i == 0:
+                pos = start_translation.copy()
+            elif s.path_mode == 'RELATIVE':
+                p = eval_polyline(points, lengths, total, u)
                 pos = start_translation + (p - path_origin)
             else:
+                p = eval_polyline(points, lengths, total, u)
                 pos = p
 
             m = start_matrix_world.copy()
@@ -1353,12 +1383,14 @@ def run_bake(context):
             if obj != root:
                 offsets[obj] = root.matrix_world.inverted() @ obj.matrix_world
 
-    for frame, u in key_specs:
-        p = eval_polyline(points, lengths, total, u)
-
-        if s.path_mode == 'RELATIVE':
+    for i, (frame, u) in enumerate(key_specs):
+        if i == 0:
+            pos = root_start_translation.copy()
+        elif s.path_mode == 'RELATIVE':
+            p = eval_polyline(points, lengths, total, u)
             pos = root_start_translation + (p - path_origin)
         else:
+            p = eval_polyline(points, lengths, total, u)
             pos = p
 
         mat = root.matrix_world.copy()
@@ -1849,7 +1881,7 @@ class IKPATHMVP_OT_unpin_bones(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.4.0"
+    bl_label = "IK Path MVP v0.4.1"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1899,6 +1931,7 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
             box.prop(s, "body_rotate", slider=True)
             box.prop(s, "leg_dangle")
             if s.leg_dangle:
+                box.prop(s, "leg_stretch_limit", slider=True)
                 box.prop(s, "leg_dangle_amount", slider=True)
             box.prop(s, "limit_stretch")
             box.prop(s, "max_reach")
