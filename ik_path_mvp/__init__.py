@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 2),
+    "version": (0, 5, 3),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Level horizontal root, timeline preview stability",
+    "description": "Draw path + live preview. Body/hips lean, horizontal level root, timeline preview stability",
     "category": "Animation",
 }
 
@@ -152,6 +152,13 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
     root_bone: bpy.props.StringProperty(
         name="Root Bone",
         description="Bone that carries the leftover translation (whole body, no stretching). Empty = auto detect",
+        default="",
+        update=_on_setting_updated,
+    )
+
+    body_bone: bpy.props.StringProperty(
+        name="Body Bone",
+        description="Bone that receives body lean/tilt (e.g. torso, hips). Empty = auto detect",
         default="",
         update=_on_setting_updated,
     )
@@ -499,6 +506,31 @@ def _find_root_bone(arm, chain, s):
         cur = cur.parent
 
     return best
+
+
+def _find_body_bone(arm, root_pb, s=None):
+    """
+    Finds the main body / torso / hips control bone to receive body lean/pitch rotation,
+    leaving the root bone strictly level and horizontal on the floor.
+    """
+    if s and hasattr(s, "body_bone") and s.body_bone.strip():
+        b = arm.pose.bones.get(s.body_bone.strip())
+        if b:
+            return b
+
+    candidates = ('torso', 'Torso', 'hips', 'Hips', 'spine_master.002', 'spine_master', 'chest', 'spine', 'pelvis')
+    for nm in candidates:
+        b = arm.pose.bones.get(nm)
+        if b is not None and b is not root_pb:
+            return b
+
+    for pb in arm.pose.bones:
+        nm = pb.name.lower()
+        if any(k in nm for k in ['torso', 'hips', 'chest', 'spine']) and not any(p in nm for p in ['mch-', 'def-', 'org-', 'wgt-', 'vis_']):
+            if pb is not root_pb:
+                return pb
+
+    return None
 
 
 # ============================================================
@@ -1220,6 +1252,10 @@ def run_bake(context, is_preview=False):
             root_base_rot = _capture_rot(root_pb) if root_pb else None
             root_world_start = (arm.matrix_world @ root_pb.matrix).translation.copy() if root_pb else None
 
+            # Find body / torso bone for body lean
+            body_pb = _find_body_bone(arm, root_pb, s)
+            body_base_rot = _capture_rot(body_pb) if body_pb else None
+
             # Find natural unstretched reach and body anchor (spine/chest)
             max_reach, base_pb = _get_chain_reach_and_base(arm, pb, s.max_reach)
             base_world_start = (arm.matrix_world @ base_pb.matrix).translation.copy() if base_pb else None
@@ -1260,6 +1296,8 @@ def run_bake(context, is_preview=False):
                     'root_start': root_start.copy() if root_start is not None else None,
                     'root_base_rot': root_base_rot,
                     'root_world_start': root_world_start.copy() if root_world_start is not None else None,
+                    'body_name': body_pb.name if body_pb else None,
+                    'body_base_rot': body_base_rot,
                     'base_world_start': base_world_start.copy() if base_world_start is not None else None,
                     'max_reach': max_reach,
                     'leg_controllers': [
@@ -1282,6 +1320,9 @@ def run_bake(context, is_preview=False):
                     root_start = _preview_rest_state['root_start'].copy() if _preview_rest_state['root_start'] is not None else None
                     root_base_rot = _preview_rest_state['root_base_rot']
                     root_world_start = _preview_rest_state['root_world_start'].copy() if _preview_rest_state['root_world_start'] is not None else None
+                if _preview_rest_state.get('body_name'):
+                    body_pb = arm.pose.bones.get(_preview_rest_state['body_name'])
+                    body_base_rot = _preview_rest_state['body_base_rot']
                 base_world_start = _preview_rest_state['base_world_start']
                 if s.max_reach <= 1e-4:
                     max_reach = _preview_rest_state['max_reach']
@@ -1347,7 +1388,7 @@ def run_bake(context, is_preview=False):
                     else:
                         head_pos = pos
 
-                # Move and rotate root (ROOT REMAINS STRICTLY STRAIGHT AND HORIZONTAL)
+                # 1. ROOT BONE: Translation ONLY, rotation strictly neutral/horizontal (ZERO tilt, feet and floor stay flat)
                 if root_pb is not None:
                     if body_move_world.length > 1e-6:
                         root_pb.location = root_start + _world_delta_to_bone_location(
@@ -1356,33 +1397,40 @@ def run_bake(context, is_preview=False):
                     else:
                         root_pb.location = root_start.copy()
 
-                    # Horizontal yaw only (around Z): root stays 100% straight and level on the floor, ZERO pitch/roll
-                    if (
-                        s.body_rotate != 0.0
-                        and root_base_rot is not None
-                        and body_move_world.length > 1e-4
-                        and i > 0
-                        and root_world_start is not None
-                    ):
-                        import math
-                        v_0_xy = Vector((start_translation.x - root_world_start.x, start_translation.y - root_world_start.y, 0.0))
-                        current_root_world = root_world_start + body_move_world
-                        tension_xy = Vector((head_pos.x - current_root_world.x, head_pos.y - current_root_world.y, 0.0))
-                        if v_0_xy.length > 1e-4 and tension_xy.length > 1e-4:
-                            angle_0 = math.atan2(v_0_xy.y, v_0_xy.x)
-                            angle_t = math.atan2(tension_xy.y, tension_xy.x)
-                            diff_angle = (angle_t - angle_0 + math.pi) % (2.0 * math.pi) - math.pi
-                            q_yaw = Quaternion((0.0, 0.0, 1.0), diff_angle * s.body_rotate)
-                            _apply_world_rotation_to_root(arm, root_pb, q_yaw, root_base_rot)
-                        else:
-                            _restore_rot(root_pb, root_base_rot)
-                    else:
-                        if root_base_rot is not None:
-                            _restore_rot(root_pb, root_base_rot)
+                    if root_base_rot is not None:
+                        _restore_rot(root_pb, root_base_rot)
 
                     context.view_layer.update()
                     keyframe_pose_bone_location(root_pb, frame)
                     keyframe_pose_bone_rotation(root_pb, frame)
+
+                # 2. BODY/TORSO/HIPS BONE: Lean and tilt towards pull direction
+                if body_pb is not None and body_base_rot is not None:
+                    if (
+                        s.body_rotate != 0.0
+                        and body_move_world.length > 1e-4
+                        and i > 0
+                        and root_world_start is not None
+                    ):
+                        current_root_world = root_world_start + body_move_world
+                        tension_vec = head_pos - current_root_world
+                        v_0 = start_translation - root_world_start
+                        if tension_vec.length > 1e-4 and v_0.length > 1e-4:
+                            q_diff = v_0.normalized().rotation_difference(tension_vec.normalized())
+                            if q_diff.angle > 1e-5:
+                                factor = min(1.0, abs(s.body_rotate) * 2.0)
+                                q_lean = q_diff if s.body_rotate > 0 else q_diff.inverted()
+                                q_applied = Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(q_lean, factor)
+                                _apply_world_rotation_to_bone(arm, body_pb, q_applied, body_base_rot)
+                            else:
+                                _restore_rot(body_pb, body_base_rot)
+                        else:
+                            _restore_rot(body_pb, body_base_rot)
+                    else:
+                        _restore_rot(body_pb, body_base_rot)
+
+                    context.view_layer.update()
+                    keyframe_pose_bone_rotation(body_pb, frame)
 
                 # Head placement
                 m = start_matrix_world.copy()
@@ -1456,6 +1504,8 @@ def run_bake(context, is_preview=False):
             msg = f"Body Drag: baked head {pb.name}"
             if root_pb is not None:
                 msg += f" + root {root_pb.name} (reach={max_reach:.2f}, follow={s.body_follow:.2f})"
+            if body_pb is not None and s.body_rotate != 0.0:
+                msg += f" + body lean {body_pb.name}"
             if pinned_matrices:
                 msg += f", {len(pinned_matrices)} pinned"
             msg += f", {key_count} keys"
@@ -1978,7 +2028,7 @@ class IKPATHMVP_OT_debug(bpy.types.Operator):
                 f"max_translate={s.root_max_translate:.3f}"
             )
             lines.append(
-                f"Body Lean: {s.body_rotate:.2f}"
+                f"Body Bone: '{s.body_bone or '(auto)'}', lean={s.body_rotate:.2f}"
             )
 
         arm = bpy.data.objects.get(s.effector_object)
@@ -2186,7 +2236,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.2"
+    bl_label = "IK Path MVP v0.5.3"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2251,6 +2301,7 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
             box.prop(s, "limit_stretch")
             box.prop(s, "max_reach")
             box.prop(s, "root_bone")
+            box.prop(s, "body_bone")
             box.prop(s, "root_max_translate")
 
         if s.solve_mode != 'DIRECT':
