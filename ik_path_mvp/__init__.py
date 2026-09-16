@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 7),
+    "version": (0, 5, 8),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Colored motion curves, world-space locks, non-destructive cancel",
+    "description": "Draw path + live preview. Move/edit curve before bake, colored motion curves, world-space locks",
     "category": "Animation",
 }
 
@@ -21,15 +21,17 @@ from math import radians, degrees
 
 _is_updating = False
 _preview_rest_state = None
+_last_curve_fingerprint = None
 
 
 def clear_preview_rest_state():
-    global _preview_rest_state
+    global _preview_rest_state, _last_curve_fingerprint
     _preview_rest_state = None
+    _last_curve_fingerprint = None
 
 
 def _on_setting_updated(self, context):
-    global _is_updating
+    global _is_updating, _last_curve_fingerprint
     if _is_updating:
         return
     if not hasattr(context, "scene") or not context.scene:
@@ -43,6 +45,9 @@ def _on_setting_updated(self, context):
                 run_bake(context, is_preview=True)
             finally:
                 _is_updating = False
+            _last_curve_fingerprint = _curve_fingerprint(
+                bpy.data.objects.get(s.path_name)
+            )
 
 
 # ============================================================
@@ -316,7 +321,26 @@ class IKPathMVPSettings(bpy.types.PropertyGroup):
 _TIMER_REGISTERED = False
 
 
+def _curve_fingerprint(path_obj):
+    """Return a lightweight hashable fingerprint of the curve's world-space geometry."""
+    if not path_obj or path_obj.type != 'CURVE':
+        return None
+    loc = path_obj.matrix_world.translation
+    parts = [round(loc.x, 5), round(loc.y, 5), round(loc.z, 5)]
+    for sp in path_obj.data.splines:
+        for pt in sp.points:
+            parts.extend([round(pt.co.x, 5), round(pt.co.y, 5), round(pt.co.z, 5)])
+        for pt in getattr(sp, 'bezier_points', []):
+            parts.extend([round(pt.co.x, 5), round(pt.co.y, 5), round(pt.co.z, 5)])
+    # Include object-level rotation/scale so G/R/S in Object mode is detected
+    for row in path_obj.matrix_world:
+        for v in row:
+            parts.append(round(v, 5))
+    return tuple(parts)
+
+
 def _controller_poll():
+    global _is_updating, _last_curve_fingerprint
     try:
         scene = bpy.context.scene
 
@@ -333,6 +357,23 @@ def _controller_poll():
                         if s.effector_object != obj.name or s.effector_bone != pb.name:
                             s.effector_object = obj.name
                             s.effector_bone = pb.name
+
+            # --- Curve-change auto-rebake during preview ---
+            if s.is_preview and s.path_name and not _is_updating:
+                path_obj = bpy.data.objects.get(s.path_name)
+                if path_obj:
+                    fp = _curve_fingerprint(path_obj)
+                    if _last_curve_fingerprint is not None and fp != _last_curve_fingerprint:
+                        _is_updating = True
+                        try:
+                            run_bake(bpy.context, is_preview=True)
+                        finally:
+                            _is_updating = False
+                        _last_curve_fingerprint = _curve_fingerprint(
+                            bpy.data.objects.get(s.path_name)
+                        )
+                    elif _last_curve_fingerprint is None:
+                        _last_curve_fingerprint = fp
     except Exception:
         pass
 
@@ -2142,7 +2183,10 @@ class IKPATHMVP_OT_draw_path(bpy.types.Operator):
 
         status, msg = run_bake(context, is_preview=True)
 
-        self.report({'INFO' if status == 'FINISHED' else 'WARNING'}, f"{msg} (Preview active: adjust sliders or click Apply Bake)")
+        global _last_curve_fingerprint
+        _last_curve_fingerprint = _curve_fingerprint(path_obj)
+
+        self.report({'INFO' if status == 'FINISHED' else 'WARNING'}, f"{msg} (Preview: tweak sliders, move/edit curve, then Apply Bake)")
 
         if self._area:
             self._area.tag_redraw()
@@ -2461,6 +2505,28 @@ class IKPATHMVP_OT_apply_bake(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IKPATHMVP_OT_rebake_preview(bpy.types.Operator):
+    bl_idname = "ikpathmvp.rebake_preview"
+    bl_label = "Rebake Preview"
+    bl_description = "Re-read the curve and update the preview animation (use after moving or editing the path curve)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        s = getattr(context.scene, "ik_path_mvp", None)
+        return s and s.is_preview and s.path_name
+
+    def execute(self, context):
+        global _last_curve_fingerprint
+        s = context.scene.ik_path_mvp
+        status, msg = run_bake(context, is_preview=True)
+        path_obj = bpy.data.objects.get(s.path_name)
+        if path_obj:
+            _last_curve_fingerprint = _curve_fingerprint(path_obj)
+        self.report({'INFO' if status == 'FINISHED' else 'WARNING'}, msg)
+        return {status}
+
+
 class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
     bl_idname = "ikpathmvp.cancel_preview"
     bl_label = "Cancel Preview"
@@ -2586,7 +2652,7 @@ class IKPATHMVP_OT_clear_all_curves(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.7"
+    bl_label = "IK Path MVP v0.5.8"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2600,11 +2666,13 @@ class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
         if s.is_preview:
             box = layout.box()
             box.alert = True
-            box.label(text="Preview Active: Tweak sliders below", icon='RESTRICT_VIEW_OFF')
+            box.label(text="Preview Active", icon='RESTRICT_VIEW_OFF')
+            box.label(text="Tweak sliders or move/edit the curve", icon='INFO')
             row = box.row(align=True)
             row.scale_y = 1.3
             row.operator("ikpathmvp.apply_bake", text="Apply Bake", icon='CHECKMARK')
             row.operator("ikpathmvp.cancel_preview", text="Cancel", icon='CANCEL')
+            box.operator("ikpathmvp.rebake_preview", text="Rebake from Curve", icon='FILE_REFRESH')
 
         # Draw
         box = layout.box()
@@ -2787,6 +2855,7 @@ classes = (
     IKPATHMVP_OT_create_path,
     IKPATHMVP_OT_bake,
     IKPATHMVP_OT_apply_bake,
+    IKPATHMVP_OT_rebake_preview,
     IKPATHMVP_OT_cancel_preview,
     IKPATHMVP_OT_clear_path,
     IKPATHMVP_OT_toggle_curves_visibility,
