@@ -1,10 +1,10 @@
 bl_info = {
     "name": "IK Path MVP",
     "author": "YourName",
-    "version": (0, 5, 4),
+    "version": (0, 5, 5),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar > IK Path MVP",
-    "description": "Draw path + live preview. Inverted body lean direction, horizontal level root, timeline preview stability",
+    "description": "Draw path + live preview. Direct single-bone isolation, non-destructive preview cancel, inverted body lean",
     "category": "Animation",
 }
 
@@ -1078,6 +1078,66 @@ def _apply_world_rotation_to_bone(arm, pb, q_world, base_rot):
 _apply_world_rotation_to_root = _apply_world_rotation_to_bone
 
 
+def _backup_action_keyframes(arm, bone_names, fstart, fend):
+    """
+    Backs up keyframe points in [fstart, fend] for the specified bone names only.
+    Returns: dict mapping (fc.data_path, fc.array_index) -> list of point dicts.
+    """
+    backup = {}
+    if not arm or not arm.animation_data or not arm.animation_data.action:
+        return backup
+    action = arm.animation_data.action
+    bone_prefixes = tuple(f'pose.bones["{bn}"].' for bn in bone_names)
+    for fc in _iter_action_fcurves(action):
+        if fc.data_path.startswith(bone_prefixes):
+            pts = []
+            for kp in fc.keyframe_points:
+                if fstart <= kp.co.x <= fend:
+                    pt_dict = {
+                        'co': (kp.co.x, kp.co.y),
+                        'handle_left': (kp.handle_left.x, kp.handle_left.y),
+                        'handle_right': (kp.handle_right.x, kp.handle_right.y),
+                        'handle_left_type': kp.handle_left_type,
+                        'handle_right_type': kp.handle_right_type,
+                        'interpolation': kp.interpolation,
+                    }
+                    if hasattr(kp, 'easing'):
+                        pt_dict['easing'] = kp.easing
+                    pts.append(pt_dict)
+            backup[(fc.data_path, fc.array_index)] = pts
+    return backup
+
+
+def _restore_action_keyframes(arm, bone_names, backup, fstart, fend):
+    """
+    Restores keyframes in [fstart, fend] for the specified bone names ONLY.
+    Any preview keys for these bones are removed, and backed up keys are re-inserted.
+    All other bones in the action remain completely untouched.
+    """
+    if not arm or not arm.animation_data or not arm.animation_data.action:
+        return
+    action = arm.animation_data.action
+    bone_prefixes = tuple(f'pose.bones["{bn}"].' for bn in bone_names)
+    for fc in _iter_action_fcurves(action):
+        if fc.data_path.startswith(bone_prefixes):
+            key = (fc.data_path, fc.array_index)
+            kps = fc.keyframe_points
+            for idx in range(len(kps) - 1, -1, -1):
+                if fstart <= kps[idx].co.x <= fend:
+                    kps.remove(kps[idx])
+            if key in backup and backup[key]:
+                for pt in backup[key]:
+                    kp = kps.insert(pt['co'][0], pt['co'][1])
+                    kp.handle_left = pt['handle_left']
+                    kp.handle_right = pt['handle_right']
+                    kp.handle_left_type = pt['handle_left_type']
+                    kp.handle_right_type = pt['handle_right_type']
+                    kp.interpolation = pt['interpolation']
+                    if hasattr(kp, 'easing') and 'easing' in pt:
+                        kp.easing = pt['easing']
+            fc.update()
+
+
 # ============================================================
 # Live Bone Pinning Helpers (COPY_TRANSFORMS constraints)
 # ============================================================
@@ -1287,9 +1347,23 @@ def run_bake(context, is_preview=False):
 
             # Store or recall preview rest state to guarantee pristine transforms during live slider tweaks
             if is_preview and _preview_rest_state is None:
+                bones_affected = [pb.name]
+                if root_pb:
+                    bones_affected.append(root_pb.name)
+                if body_pb:
+                    bones_affected.append(body_pb.name)
+                for leg in leg_controllers:
+                    bones_affected.append(leg['bone'].name)
+                for b in pinned_matrices:
+                    bones_affected.append(b.name)
+                bones_affected = list(dict.fromkeys(bones_affected))
+                fcurve_backup = _backup_action_keyframes(arm, bones_affected, s.frame_start, s.frame_end)
+
                 _preview_rest_state = {
                     'mode': 'BODY_DRAG',
                     'bone_name': pb.name,
+                    'bones_affected': bones_affected,
+                    'fcurve_backup': fcurve_backup,
                     'start_matrix_world': start_matrix_world.copy(),
                     'start_translation': start_translation.copy(),
                     'root_name': root_pb.name if root_pb else None,
@@ -1526,9 +1600,13 @@ def run_bake(context, is_preview=False):
         start_translation = start_matrix_world.translation.copy()
 
         if is_preview and _preview_rest_state is None:
+            bones_affected = [pb.name]
+            fcurve_backup = _backup_action_keyframes(arm, bones_affected, s.frame_start, s.frame_end)
             _preview_rest_state = {
                 'mode': 'DIRECT',
                 'bone_name': pb.name,
+                'bones_affected': bones_affected,
+                'fcurve_backup': fcurve_backup,
                 'start_matrix_world': start_matrix_world.copy(),
                 'start_translation': start_translation.copy(),
             }
@@ -1552,23 +1630,7 @@ def run_bake(context, is_preview=False):
             pb.matrix = inv @ m
             context.view_layer.update()
 
-            for b, d in deltas.items():
-                if b not in pinned_matrices:
-                    b.matrix = pb.matrix @ d
-
-            for b_pin, m_w in pinned_matrices.items():
-                b_pin.matrix = inv @ m_w
-
-            context.view_layer.update()
-
             keyframe_pose_bone(pb, frame)
-
-            for b in deltas.keys():
-                if b not in pinned_matrices:
-                    keyframe_pose_bone(b, frame)
-
-            for b_pin in pinned_matrices.keys():
-                keyframe_pose_bone(b_pin, frame)
 
         set_smooth_keys_obj(arm)
         if is_preview:
@@ -1577,7 +1639,7 @@ def run_bake(context, is_preview=False):
             context.scene.frame_set(s.frame_start)
         context.view_layer.update()
 
-        msg = f"Direct baked bone {pb.name} (+{len(deltas)} bones), {key_count} keys"
+        msg = f"Direct baked bone {pb.name}, {key_count} keys"
 
         if not is_preview and s.delete_path_after_bake:
             bpy.data.objects.remove(path_obj, do_unlink=True)
@@ -2191,15 +2253,17 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 
         arm = bpy.data.objects.get(s.effector_object)
         if arm and arm.type == 'ARMATURE':
-            if arm.animation_data and arm.animation_data.action:
-                action = arm.animation_data.action
-                fstart = s.frame_start
-                fend = s.frame_end
-                for fcurve in _iter_action_fcurves(action):
-                    kps = fcurve.keyframe_points
-                    for idx in range(len(kps) - 1, -1, -1):
-                        if fstart <= kps[idx].co.x <= fend:
-                            kps.remove(kps[idx])
+            fstart = s.frame_start
+            fend = s.frame_end
+
+            # Only restore/revert keyframes on bones that were affected by THIS preview!
+            # All other bones and previously baked animations remain completely untouched.
+            if _preview_rest_state and 'bones_affected' in _preview_rest_state:
+                bones_affected = _preview_rest_state['bones_affected']
+                backup = _preview_rest_state.get('fcurve_backup', {})
+                _restore_action_keyframes(arm, bones_affected, backup, fstart, fend)
+            elif arm.animation_data and arm.animation_data.action and s.effector_bone:
+                _restore_action_keyframes(arm, [s.effector_bone], {}, fstart, fend)
 
             # Restore pristine rest pose if available
             if _preview_rest_state:
@@ -2236,7 +2300,7 @@ class IKPATHMVP_OT_cancel_preview(bpy.types.Operator):
 # ============================================================
 
 class VIEW3D_PT_ikpath_mvp(bpy.types.Panel):
-    bl_label = "IK Path MVP v0.5.4"
+    bl_label = "IK Path MVP v0.5.5"
     bl_idname = "VIEW3D_PT_ikpath_mvp"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
